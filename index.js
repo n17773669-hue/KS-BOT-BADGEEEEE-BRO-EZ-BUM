@@ -50,20 +50,20 @@ const DEVICE_PROFILES = [
 ];
 
 const HYPESQUAD_BADGES = {
-    1: { 
-        name: "HypeSquad Bravery", 
+    1: {
+        name: "HypeSquad Bravery",
         badgeUrl: "https://images.credly.com/images/07d8d211-1ce6-42d6-84fc-8e47f7b57223/hypesquad_bravery.png",
-        desc: "Dũng cảm & Nhiệt huyết" 
+        desc: "Dũng cảm & Nhiệt huyết"
     },
-    2: { 
-        name: "HypeSquad Brilliance", 
+    2: {
+        name: "HypeSquad Brilliance",
         badgeUrl: "https://images.credly.com/images/13c33971-8bc7-438e-8a22-c397500b4111/hypesquad_brilliance.png",
-        desc: "Sáng suốt & Kỷ luật" 
+        desc: "Sáng suốt & Kỷ luật"
     },
-    3: { 
-        name: "HypeSquad Balance", 
+    3: {
+        name: "HypeSquad Balance",
         badgeUrl: "https://images.credly.com/images/9c379a29-22a1-4357-a45e-b9e7740e6c51/hypesquad_balance.png",
-        desc: "Cân bằng & Hài hòa" 
+        desc: "Cân bằng & Hài hòa"
     }
 };
 
@@ -233,7 +233,7 @@ async function resolveMediaSource(mediaUrl) {
 }
 
 // ==============================================================================
-// MODULE 3: VOICE STREAMER & RUỘT STREAM CHUẨN XÁC
+// MODULE 3: VOICE STREAMER
 // ==============================================================================
 async function stopVoiceStreamer(botClient, userId) {
     const active = activeVoiceStreamers.get(userId);
@@ -241,18 +241,30 @@ async function stopVoiceStreamer(botClient, userId) {
 
     try {
         if (active.ffmpeg) {
-            try { active.ffmpeg.kill('SIGKILL'); } catch (e) {}
+            try { active.ffmpeg.destroy(); } catch (e) {}
+            try { active.ffmpeg.process?.kill('SIGKILL'); } catch (e) {}
         }
         if (active.selfClient) {
             try { active.selfClient.destroy(); } catch (e) {}
         }
+        // Cho bot chính rời voice
         if (active.guildId && botClient) {
             const guild = botClient.guilds.cache.get(active.guildId);
             if (guild) {
-                guild.voiceAdapterCreator.destroyConnection(active.guildId);
+                guild.shard.send({
+                    op: 4,
+                    d: {
+                        guild_id: active.guildId,
+                        channel_id: null,
+                        self_mute: false,
+                        self_deaf: false
+                    }
+                });
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[VoiceStream] Lỗi khi dừng:', e);
+    }
 
     activeVoiceStreamers.delete(userId);
     db.delete('voice_streams', userId);
@@ -261,6 +273,7 @@ async function stopVoiceStreamer(botClient, userId) {
 
 async function startVoiceStreamer(botClient, userId, streamerToken, guildId, channelId, mediaUrl = '') {
     if (!channelId || !streamerToken) return { ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" };
+    if (!/^\d{15,22}$/.test(channelId)) return { ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" };
 
     await stopVoiceStreamer(botClient, userId);
 
@@ -269,8 +282,9 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
         const sessionObj = { selfClient, ffmpeg: null, guildId, channelId, mediaUrl };
         activeVoiceStreamers.set(userId, sessionObj);
 
-        selfClient.on('clientReady', async () => {
-            console.log(`[VoiceStream - AntiBan] Selfbot đăng nhập: ${selfClient.user.tag}`);
+        // QUAN TRỌNG: selfbot dùng event 'ready' (không phải 'clientReady')
+        selfClient.on('ready', async () => {
+            console.log(`[VoiceStream] Selfbot đăng nhập: ${selfClient.user.tag}`);
             try {
                 let targetGuildId = guildId;
                 if (!targetGuildId) {
@@ -298,18 +312,17 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                         });
                         console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}] thành công!`);
                     } catch (err) {
-                        console.error(`[BotVoice] Lỗi bot tham gia voice:`, err.message);
+                        console.error(`[BotVoice] Lỗi bot tham gia voice:`, err);
                     }
                 }
 
-                // Khởi tạo Streamer đúng chuẩn file mẫu của bạn
                 const streamer = new Streamer(selfClient);
 
                 console.log("[+] Đang kết nối vào Voice Channel...");
                 await streamer.joinVoice(targetGuildId, channelId);
                 console.log("[+] Đã vào phòng voice thành công!");
 
-                // Khóa cứng Mic (Mute) ngay lập tức
+                // Khóa cứng Mic (Mute)
                 await selfClient.ws.broadcast({
                     op: 4,
                     d: {
@@ -363,15 +376,16 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 const ffmpegProc = new prism.FFmpeg({ args: ffmpegArgs });
                 sessionObj.ffmpeg = ffmpegProc;
 
-                console.log(`[VoiceStream] Stream màn hình đang chạy ngầm ổn định tuyệt đối!`);
+                console.log(`[VoiceStream] Stream đang chạy ngầm ổn định!`);
             } catch (err) {
-                console.error(`[VoiceStream] Lỗi luồng stream:`, err.message);
+                console.error(`[VoiceStream] Lỗi luồng stream:`, err);
             }
         });
 
         await selfClient.login(streamerToken);
         return { ok: true };
     } catch (err) {
+        console.error('[VoiceStream] Lỗi đăng nhập selfbot:', err);
         activeVoiceStreamers.delete(userId);
         return { ok: false, msg: err.message };
     }
@@ -417,7 +431,7 @@ class DiscordUserAPI {
 }
 
 // ==============================================================================
-// MODULE 5: GIAO DIỆN COMPONENTS V2 (2 HÀNG CÂN ĐỐI)
+// MODULE 5: GIAO DIỆN COMPONENTS V2
 // ==============================================================================
 function buildDashboard() {
     return [
@@ -467,6 +481,7 @@ const client = new Client({
     ]
 });
 
+// Bot chính (discord.js bản mới) dùng 'clientReady'. Nếu bản cũ hơn v14.22 thì đổi thành 'ready'.
 client.once('clientReady', async () => {
     console.log(`[+] Bot đã đăng nhập: ${client.user.tag}`);
     await fetchLatestBuildNumber();
@@ -483,7 +498,7 @@ client.once('clientReady', async () => {
     ].map(cmd => cmd.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
-    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID || client.user.id), { body: commands }).catch(() => {});
+    await rest.put(Routes.applicationCommands(process.env.CLIENT_ID || client.user.id), { body: commands }).catch(console.error);
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -642,7 +657,7 @@ client.on('interactionCreate', async (interaction) => {
             const houseId = parseInt(houseIdStr, 10);
             const houseInfo = HYPESQUAD_BADGES[houseId];
             const api = new DiscordUserAPI(token);
-            
+
             const res = await api.post('/hypesquad/online', { house_id: houseId });
             if (res.status === 204 || res.status === 200) {
                 const successEmbed = new EmbedBuilder()
