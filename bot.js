@@ -2,6 +2,7 @@ require('dotenv').config();
 const {
     Client,
     GatewayIntentBits,
+    Options,
     ChannelType,
     PermissionFlagsBits,
     REST,
@@ -16,30 +17,30 @@ const {
     EmbedBuilder,
     MessageFlags
 } = require('discord.js');
-const { Client: SelfClient } = require('discord.js-selfbot-v13');
-const { Streamer } = require('@dank074/discord-video-stream');
-const prism = require('prism-media');
+const { fork } = require('child_process');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
 // ==============================================================================
-// CẤU HÌNH HỆ THỐNG & DISCORD CLOUD DATABASE
+// CẤU HÌNH
 // ==============================================================================
 const API_BASE = 'https://discord.com/api/v9';
 const DB_GUILD_ID = process.env.DB_GUILD_ID || '1571370887683375124';
 const DEFAULT_THUMBNAIL = process.env.THUMBNAIL_URL || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop';
+const STREAM_SCRIPT = path.join(__dirname, 'stream.js');
 
 const LOCAL_CACHE_DIR = path.join(__dirname, 'cache_db');
 if (!fs.existsSync(LOCAL_CACHE_DIR)) fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
 
-const DB_CHANNELS_SPEC = {
-    tokens: 'db-tokens',
-    fingerprints: 'db-fingerprints',
-    sessions: 'db-sessions',
-    setups: 'db-setups',
-    voice_streams: 'db-voice-streams'
-};
+// Chỉ còn bảng "tokens" được lưu lên Discord (kênh db-tokens).
+// "voice_streams" chỉ lưu file local để điền sẵn form, không đẩy lên Discord.
+const CLOUD_TABLES = { tokens: 'db-tokens' };
+const LOCAL_TABLES = ['tokens', 'voice_streams'];
+// Các kênh cũ sẽ bị XÓA SẠCH TIN NHẮN 1 lần duy nhất (token ở db-tokens được giữ nguyên)
+const PURGE_CHANNELS = ['db-fingerprints', 'db-sessions', 'db-setups', 'db-voice-streams'];
+const PURGE_MARKER = path.join(LOCAL_CACHE_DIR, '.purged_v2');
+const OLD_LOCAL_FILES = ['fingerprints.json', 'sessions.json', 'setups.json'];
 
 const DEVICE_PROFILES = [
     {
@@ -71,12 +72,31 @@ const activeVoiceStreamers = new Map();
 let cachedBuildNumber = 504649;
 
 // ==============================================================================
-// MODULE 1: DISCORD CLOUD DATABASE
+// MODULE 1: LƯU TRỮ (nhẹ) - tokens đồng bộ lên Discord, phần còn lại lưu local
 // ==============================================================================
+async function purgeChannel(channel) {
+    let total = 0;
+    for (let i = 0; i < 50; i++) {
+        const msgs = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+        if (!msgs || msgs.size === 0) break;
+        const deleted = await channel.bulkDelete(msgs, true).catch(() => null);
+        let removed = deleted ? deleted.size : 0;
+        const rest = msgs.filter(m => !deleted || !deleted.has(m.id));
+        for (const m of rest.values()) {
+            const ok = await m.delete().then(() => true).catch(() => false);
+            if (ok) removed++;
+        }
+        total += removed;
+        if (removed === 0) break;
+    }
+    return total;
+}
+
 class DiscordCloudDB {
     constructor() {
         this.channels = {};
-        this.store = { tokens: {}, fingerprints: {}, sessions: {}, setups: {}, voice_streams: {} };
+        this.store = {};
+        for (const t of LOCAL_TABLES) this.store[t] = {};
         this.syncTimers = {};
     }
 
@@ -89,17 +109,16 @@ class DiscordCloudDB {
         return {};
     }
     _writeLocal(table, data) {
-        try { fs.writeFileSync(this._cachePath(table), JSON.stringify(data, null, 2), 'utf8'); } catch (e) {}
+        try { fs.writeFileSync(this._cachePath(table), JSON.stringify(data), 'utf8'); } catch (e) {}
     }
 
     async init(client) {
-        for (const table of Object.keys(DB_CHANNELS_SPEC)) {
-            this.store[table] = this._readLocal(table);
-        }
-        const guild = await client.guilds.fetch(DB_GUILD_ID).catch(() => null);
-        if (!guild) return;
+        for (const table of LOCAL_TABLES) this.store[table] = this._readLocal(table);
 
-        let allChannels = await guild.channels.fetch().catch(() => null);
+        const guild = await client.guilds.fetch(DB_GUILD_ID).catch(() => null);
+        if (!guild) { console.log('[DB] Không thấy server DB, dùng file local.'); return; }
+
+        const allChannels = await guild.channels.fetch().catch(() => null);
         if (!allChannels) return;
 
         let category = allChannels.find(c => c.type === ChannelType.GuildCategory && c.name === 'BOT-CLOUD-DB');
@@ -110,9 +129,9 @@ class DiscordCloudDB {
                 permissionOverwrites: [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }]
             }).catch(() => null);
         }
-        if (!category) return;
 
-        for (const [table, chName] of Object.entries(DB_CHANNELS_SPEC)) {
+        // Kênh lưu token
+        for (const [table, chName] of Object.entries(CLOUD_TABLES)) {
             let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
             if (!channel && category) {
                 channel = await guild.channels.create({
@@ -123,25 +142,54 @@ class DiscordCloudDB {
             }
             if (channel) {
                 this.channels[table] = channel;
-                await this._loadFromChannel(table, channel);
+                await this._loadFromChannel(table, channel, client);
             }
+        }
+
+        // Dọn các kênh cũ (chỉ 1 lần)
+        if (!fs.existsSync(PURGE_MARKER)) {
+            console.log('[DB] Đang xóa tin nhắn các kênh DB cũ...');
+            for (const chName of PURGE_CHANNELS) {
+                const ch = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
+                if (ch) {
+                    const n = await purgeChannel(ch);
+                    console.log(`[DB] ${chName}: đã xóa ${n} tin nhắn`);
+                }
+            }
+            for (const f of OLD_LOCAL_FILES) {
+                try { fs.unlinkSync(path.join(LOCAL_CACHE_DIR, f)); } catch (e) {}
+            }
+            try { fs.writeFileSync(PURGE_MARKER, new Date().toISOString()); } catch (e) {}
+            console.log('[DB] Dọn dẹp xong.');
         }
     }
 
-    async _loadFromChannel(table, channel) {
+    // Đọc được cả bản mới (file đính kèm tokens.json) lẫn bản cũ (khối ```json)
+    async _loadFromChannel(table, channel, client) {
         try {
-            const messages = await channel.messages.fetch({ limit: 5 });
-            const msg = messages.first();
-            if (msg) {
-                let raw = msg.content;
-                const match = raw.match(/```json([\s\S]*?)```/);
+            const messages = await channel.messages.fetch({ limit: 10 });
+            const mine = messages.filter(m => m.author.id === client.user.id);
+            for (const msg of mine.values()) {
+                const att = msg.attachments.find(a => a.name === `${table}.json`);
+                if (att) {
+                    const res = await axios.get(att.url, { responseType: 'json', timeout: 15000 });
+                    if (res.data && typeof res.data === 'object') {
+                        this.store[table] = res.data;
+                        this._writeLocal(table, res.data);
+                        return;
+                    }
+                }
+                const match = msg.content.match(/```json([\s\S]*?)```/);
                 if (match) {
                     const parsed = JSON.parse(match[1]);
                     this.store[table] = parsed;
                     this._writeLocal(table, parsed);
+                    return;
                 }
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error('[DB] Lỗi đọc từ kênh:', e.message);
+        }
     }
 
     get(table, key = null) {
@@ -153,14 +201,14 @@ class DiscordCloudDB {
         if (!this.store[table]) this.store[table] = {};
         this.store[table][String(key)] = value;
         this._writeLocal(table, this.store[table]);
-        this._scheduleFlush(table);
+        if (CLOUD_TABLES[table]) this._scheduleFlush(table);
     }
 
     delete(table, key) {
         if (this.store[table] && this.store[table][String(key)] !== undefined) {
             delete this.store[table][String(key)];
             this._writeLocal(table, this.store[table]);
-            this._scheduleFlush(table);
+            if (CLOUD_TABLES[table]) this._scheduleFlush(table);
         }
     }
 
@@ -169,19 +217,25 @@ class DiscordCloudDB {
         this.syncTimers[table] = setTimeout(() => this.flush(table), 3000);
     }
 
+    // Đẩy lên Discord dạng 1 file đính kèm (không giới hạn 2000 ký tự)
     async flush(table) {
         const channel = this.channels[table];
         if (!channel) return;
         try {
-            const dataStr = JSON.stringify(this.store[table], null, 2);
-            if (dataStr.length <= 1900) {
-                const msgs = await channel.messages.fetch({ limit: 5 });
-                const botMsg = msgs.find(m => m.author.id === channel.client.user.id);
-                const content = `\`\`\`json\n${dataStr}\n\`\`\``;
-                if (botMsg) await botMsg.edit(content);
-                else await channel.send(content);
+            const buf = Buffer.from(JSON.stringify(this.store[table]), 'utf8');
+            const old = await channel.messages.fetch({ limit: 10 });
+            const sent = await channel.send({
+                content: `📦 ${table} (${Object.keys(this.store[table]).length})`,
+                files: [{ attachment: buf, name: `${table}.json` }]
+            });
+            for (const m of old.values()) {
+                if (m.id !== sent.id && m.author.id === channel.client.user.id) {
+                    await m.delete().catch(() => {});
+                }
             }
-        } catch (e) {}
+        } catch (e) {
+            console.error('[DB] Lỗi đồng bộ:', e.message);
+        }
     }
 }
 
@@ -202,75 +256,28 @@ async function resolveMediaSource(mediaUrl) {
             });
             const html = String(res.data || '');
             let bestMp4 = null;
-            let idx = html.indexOf('.pinimg.com/videos/');
+            const idx = html.indexOf('.pinimg.com/videos/');
             if (idx !== -1) {
-                let start = html.lastIndexOf('https://', idx);
-                let end = html.indexOf('.mp4', idx);
-                if (start !== -1 && end !== -1) {
-                    bestMp4 = html.substring(start, end + 4);
-                }
+                const start = html.lastIndexOf('https://', idx);
+                const end = html.indexOf('.mp4', idx);
+                if (start !== -1 && end !== -1) bestMp4 = html.substring(start, end + 4);
             }
-            const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
-            return {
-                type: 'pinterest',
-                streamUrl: bestMp4,
-                title: titleMatch ? titleMatch[1].slice(0, 60) : 'Pinterest Video Loop'
-            };
+            return { type: 'pinterest', streamUrl: bestMp4 };
         } catch (e) {
             return null;
         }
     }
 
     if (/\.(mp4|webm|mkv|m3u8)(\?.*)?$/i.test(mediaUrl)) {
-        return {
-            type: 'direct',
-            streamUrl: mediaUrl,
-            title: 'Direct Media Loop'
-        };
+        return { type: 'direct', streamUrl: mediaUrl };
     }
 
     return null;
 }
 
 // ==============================================================================
-// MODULE 3: VOICE STREAMER
+// MODULE 3: VOICE STREAMER - mỗi phiên chạy trong 1 tiến trình riêng (stream.js)
 // ==============================================================================
-async function stopVoiceStreamer(botClient, userId) {
-    const active = activeVoiceStreamers.get(userId);
-    if (!active) return false;
-
-    try {
-        if (active.ffmpeg) {
-            try { active.ffmpeg.destroy(); } catch (e) {}
-            try { active.ffmpeg.process?.kill('SIGKILL'); } catch (e) {}
-        }
-        if (active.selfClient) {
-            try { active.selfClient.destroy(); } catch (e) {}
-        }
-        // Cho bot chính rời voice
-        if (active.guildId && botClient) {
-            const guild = botClient.guilds.cache.get(active.guildId);
-            if (guild) {
-                guild.shard.send({
-                    op: 4,
-                    d: {
-                        guild_id: active.guildId,
-                        channel_id: null,
-                        self_mute: false,
-                        self_deaf: false
-                    }
-                });
-            }
-        }
-    } catch (e) {
-        console.error('[VoiceStream] Lỗi khi dừng:', e);
-    }
-
-    activeVoiceStreamers.delete(userId);
-    db.delete('voice_streams', userId);
-    return true;
-}
-
 async function notifyUser(botClient, userId, text) {
     try {
         const user = await botClient.users.fetch(userId);
@@ -280,160 +287,140 @@ async function notifyUser(botClient, userId, text) {
     }
 }
 
-function withTimeout(promise, ms, label) {
-    let t;
-    const timeout = new Promise((_, reject) => {
-        t = setTimeout(() => reject(new Error(`TIMEOUT: ${label} quá ${ms / 1000}s`)), ms);
-    });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+function botLeaveVoiceIfIdle(botClient, guildId, exceptUserId) {
+    if (!guildId || !botClient) return;
+    // Còn người khác đang treo trong cùng server thì bot ở lại
+    for (const [uid, s] of activeVoiceStreamers) {
+        if (uid !== exceptUserId && s.guildId === guildId) return;
+    }
+    const guild = botClient.guilds.cache.get(guildId);
+    if (!guild) return;
+    try {
+        guild.shard.send({
+            op: 4,
+            d: { guild_id: guildId, channel_id: null, self_mute: false, self_deaf: false }
+        });
+    } catch (e) {}
 }
 
-function startVoiceStreamer(botClient, userId, streamerToken, guildId, channelId, mediaUrl = '') {
+async function stopVoiceStreamer(botClient, userId) {
+    const active = activeVoiceStreamers.get(userId);
+    if (!active) return false;
+
+    active.stopping = true;
+    try { active.child.kill('SIGKILL'); } catch (e) {}
+
+    botLeaveVoiceIfIdle(botClient, active.guildId, userId);
+
+    activeVoiceStreamers.delete(userId);
+    db.delete('voice_streams', userId);
+    return true;
+}
+
+function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUrl = '') {
     return new Promise(async (resolve) => {
         if (!channelId || !streamerToken) return resolve({ ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" });
         if (!/^\d{15,22}$/.test(channelId)) return resolve({ ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" });
+        if (!fs.existsSync(STREAM_SCRIPT)) return resolve({ ok: false, msg: "Thiếu file stream.js cạnh file bot! Hãy upload cả 2 file vào cùng thư mục." });
 
         await stopVoiceStreamer(botClient, userId);
 
-        const selfClient = new SelfClient({ checkUpdate: false });
-        const sessionObj = { selfClient, ffmpeg: null, guildId: null, channelId, mediaUrl };
-        activeVoiceStreamers.set(userId, sessionObj);
+        // Lấy link video thật (nếu có)
+        let streamUrl = '';
+        let note = '';
+        if (mediaUrl) {
+            const r = await resolveMediaSource(mediaUrl);
+            if (r && r.streamUrl) streamUrl = r.streamUrl;
+            else note = '⚠️ Không lấy được video từ link, đang treo màn hình đen.';
+        }
+
+        const env = { ...process.env, STREAM_TOKEN: streamerToken, STREAM_CHANNEL_ID: channelId, STREAM_MEDIA_URL: streamUrl };
+        delete env.BOT_TOKEN; // tiến trình stream không cần token bot
+
+        const child = fork(STREAM_SCRIPT, [], {
+            env,
+            stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+            execArgv: ['--max-old-space-size=160']
+        });
+
+        const sess = { child, guildId: null, channelId, stopping: false };
+        activeVoiceStreamers.set(userId, sess);
 
         let finished = false;
-        let started = false;
+        let overallTimer;
 
-        // Kết thúc phiên: thành công thì trả ok, thất bại thì dọn dẹp + DM báo lỗi
         const done = async (ok, msg) => {
             if (finished) return;
             finished = true;
-            clearTimeout(readyTimer);
+            clearTimeout(overallTimer);
             if (!ok) {
                 console.error('[VoiceStream] THẤT BẠI:', msg);
-                if (activeVoiceStreamers.get(userId) === sessionObj) {
-                    await stopVoiceStreamer(botClient, userId);
-                }
+                if (activeVoiceStreamers.get(userId) === sess) await stopVoiceStreamer(botClient, userId);
                 await notifyUser(botClient, userId, msg);
             }
-            resolve({ ok, msg });
+            resolve({ ok, msg, note });
         };
 
-        // Nếu 30s mà selfbot chưa đăng nhập xong thì báo lỗi
-        const readyTimer = setTimeout(() => {
-            if (!started) done(false, "❌ Đăng nhập tài khoản streamer quá lâu (30s). Token có thể sai hoặc acc đang bị Discord chặn tạm thời.");
-        }, 30000);
+        overallTimer = setTimeout(() => done(false, '❌ Khởi động stream quá lâu (75s), đã hủy.'), 75000);
 
-        // Selfbot dùng event 'ready' (không phải 'clientReady')
-        selfClient.on('ready', async () => {
-            if (started) return; // tránh chạy 2 lần
-            started = true;
-            clearTimeout(readyTimer);
-            console.log(`[VoiceStream] Selfbot đăng nhập: ${selfClient.user.tag}`);
+        child.on('message', (m) => {
+            if (!m || !m.type) return;
 
-            try {
-                // 1. Tìm phòng voice -> tự lấy Guild ID từ phòng (không tin Guild ID người dùng nhập)
-                const channel = await selfClient.channels.fetch(channelId).catch(() => null);
-                if (!channel || !channel.guild) {
-                    return done(false, `❌ Không tìm thấy Voice Channel \`${channelId}\`.\nKiểm tra lại ID, hoặc tài khoản streamer chưa tham gia server chứa phòng đó.`);
-                }
-                if (typeof channel.isVoice === 'function' && !channel.isVoice()) {
-                    return done(false, `❌ Kênh \`${channelId}\` không phải kênh Voice.`);
-                }
-
-                const targetGuildId = channel.guild.id;
-                sessionObj.guildId = targetGuildId;
-                console.log(`[+] Tìm thấy phòng: ${channel.name} (server: ${channel.guild.name})`);
-
-                // 2. Bot chính vào voice chung (nếu bot có trong server đó)
-                const botGuild = botClient.guilds.cache.get(targetGuildId);
+            if (m.type === 'channel') {
+                sess.guildId = m.guildId;
+                // Bot chính vào voice chung (nếu bot có trong server và chưa ở phòng nào)
+                const botGuild = botClient.guilds.cache.get(m.guildId);
                 if (botGuild) {
-                    try {
-                        botGuild.shard.send({
-                            op: 4,
-                            d: { guild_id: targetGuildId, channel_id: channelId, self_mute: true, self_deaf: true }
-                        });
-                        console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}]`);
-                    } catch (err) {
-                        console.error(`[BotVoice] Lỗi bot tham gia voice:`, err);
+                    const cur = botGuild.voiceStates.cache.get(botClient.user.id)?.channelId;
+                    if (!cur) {
+                        try {
+                            botGuild.shard.send({
+                                op: 4,
+                                d: { guild_id: m.guildId, channel_id: channelId, self_mute: true, self_deaf: true }
+                            });
+                            console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}]`);
+                        } catch (err) {
+                            console.error('[BotVoice] Lỗi bot tham gia voice:', err);
+                        }
                     }
-                } else {
-                    console.log('[BotVoice] Bot chính không ở trong server này, bỏ qua.');
                 }
-
-                // 3. Selfbot vào voice (tối đa 20s)
-                const streamer = new Streamer(selfClient);
-                console.log("[+] Đang kết nối vào Voice Channel...");
-                try {
-                    await withTimeout(streamer.joinVoice(targetGuildId, channelId), 20000, 'vào voice');
-                } catch (err) {
-                    console.error(err);
-                    return done(false, `❌ Không vào được phòng voice <#${channelId}> (quá 20 giây).\nCó thể acc streamer không có quyền **Kết nối** vào phòng, phòng đã đầy, hoặc phòng bị giới hạn.`);
+            } else if (m.type === 'ready') {
+                done(true, `Đã vào phòng **${m.channelName || channelId}**`);
+            } else if (m.type === 'error') {
+                done(false, m.text);
+            } else if (m.type === 'ended') {
+                if (activeVoiceStreamers.get(userId) === sess && !sess.stopping) {
+                    stopVoiceStreamer(botClient, userId);
+                    notifyUser(botClient, userId, `⚠️ Phiên stream đã dừng bất ngờ: ${m.reason || 'không rõ lý do'}`);
                 }
-                console.log("[+] Đã vào phòng voice thành công!");
-
-                // 4. Khóa Mic
-                await selfClient.ws.broadcast({
-                    op: 4,
-                    d: { guild_id: targetGuildId, channel_id: channelId, self_mute: true, self_deaf: false }
-                });
-                console.log("[+] Đã khóa cứng Mic (Mute) thành công!");
-
-                // 5. Tạo luồng stream
-                console.log("[+] Đang khởi tạo luồng stream...");
-                const udpStream = await withTimeout(streamer.createStream(), 20000, 'tạo luồng stream');
-
-                const resolved = mediaUrl ? await resolveMediaSource(mediaUrl) : null;
-                let ffmpegArgs;
-
-                if (resolved && resolved.streamUrl) {
-                    ffmpegArgs = [
-                        '-re',
-                        '-stream_loop', '-1',
-                        '-i', resolved.streamUrl,
-                        '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2',
-                        '-pix_fmt', 'yuv420p',
-                        '-vcodec', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-tune', 'zerolatency',
-                        '-r', '30',
-                        '-g', '60',
-                        '-b:v', '1000k',
-                        '-an',
-                        '-f', 'rtsp',
-                        udpStream
-                    ];
-                } else {
-                    ffmpegArgs = [
-                        '-f', 'lavfi',
-                        '-i', 'color=c=black:s=1280x720:r=30',
-                        '-pix_fmt', 'yuv420p',
-                        '-vcodec', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-tune', 'zerolatency',
-                        '-r', '30',
-                        '-g', '60',
-                        '-b:v', '1000k',
-                        '-f', 'rtsp',
-                        udpStream
-                    ];
-                }
-
-                sessionObj.ffmpeg = new prism.FFmpeg({ args: ffmpegArgs });
-                console.log(`[VoiceStream] Stream đang chạy ngầm ổn định!`);
-
-                done(true, `Đã vào phòng **${channel.name}**`);
-            } catch (err) {
-                console.error(`[VoiceStream] Lỗi luồng stream:`, err);
-                done(false, `❌ Lỗi khi stream: ${err.message}`);
             }
         });
 
-        // Token sai -> login ném lỗi
-        selfClient.login(streamerToken).catch((err) => {
-            console.error('[VoiceStream] Lỗi đăng nhập selfbot:', err);
-            done(false, `❌ Token không hợp lệ hoặc không đăng nhập được.\nChi tiết: ${err.message}`);
+        child.on('exit', (code) => {
+            if (sess.stopping) return;
+            if (!finished) {
+                done(false, `❌ Tiến trình stream bị tắt đột ngột (code ${code}). Có thể hosting hết RAM.`);
+            } else if (activeVoiceStreamers.get(userId) === sess) {
+                stopVoiceStreamer(botClient, userId);
+                notifyUser(botClient, userId, `⚠️ Phiên stream đã dừng bất ngờ (code ${code}). Có thể hosting hết RAM, hãy bật lại.`);
+            }
+        });
+
+        child.on('error', (err) => {
+            done(false, `❌ Không chạy được tiến trình stream: ${err.message}`);
         });
     });
 }
+
+// Tắt bot thì tắt luôn các tiến trình stream
+function killAllStreams() {
+    for (const s of activeVoiceStreamers.values()) {
+        try { s.child.kill('SIGKILL'); } catch (e) {}
+    }
+}
+process.on('exit', killAllStreams);
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
 
 // ==============================================================================
 // MODULE 4: TOKEN & API HELPER
@@ -478,12 +465,11 @@ class DiscordUserAPI {
 // MODULE 5: GIAO DIỆN COMPONENTS V2
 // ==============================================================================
 function buildDashboard(avatarUrl) {
-    // Ảnh nhỏ bên phải: ưu tiên THUMBNAIL_URL trong .env, không có thì dùng avatar của bot
     const thumb = process.env.THUMBNAIL_URL || avatarUrl || DEFAULT_THUMBNAIL;
     return [
         {
             type: 17,
-            accent_color: 0x9B59FF, // viền tím bên trái
+            accent_color: 0x9B59FF,
             components: [
                 {
                     type: 9,
@@ -528,18 +514,23 @@ function buildDashboard(avatarUrl) {
 }
 
 // ==============================================================================
-// MODULE 6: KHỞI TẠO BOT & SLASH COMMANDS
+// MODULE 6: KHỞI TẠO BOT & SLASH COMMANDS (đã giảm intents + cache để nhẹ RAM)
 // ==============================================================================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMembers
-    ]
+        GatewayIntentBits.GuildVoiceStates
+    ],
+    makeCache: Options.cacheWithLimits({
+        ...(Options.DefaultMakeCacheSettings || {}),
+        MessageManager: 0,
+        PresenceManager: 0,
+        ReactionManager: 0,
+        ThreadManager: 0
+    })
 });
 
-// Bot chính (discord.js bản mới) dùng 'clientReady'. Nếu bản cũ hơn v14.22 thì đổi thành 'ready'.
+// Nếu discord.js của bạn cũ hơn v14.22 thì đổi 'clientReady' thành 'ready'
 client.once('clientReady', async () => {
     console.log(`[+] Bot đã đăng nhập: ${client.user.tag}`);
     await fetchLatestBuildNumber();
@@ -565,7 +556,10 @@ client.on('interactionCreate', async (interaction) => {
             const uid = interaction.user.id;
 
             if (interaction.commandName === 'setup_menu') {
-                await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: buildDashboard(client.user.displayAvatarURL({ size: 256, extension: 'png' })) });
+                await interaction.channel.send({
+                    flags: MessageFlags.IsComponentsV2,
+                    components: buildDashboard(client.user.displayAvatarURL({ size: 256, extension: 'png' }))
+                });
                 return interaction.reply({ content: "✅ Đã gửi bảng menu Stream & HypeSquad thành công!", flags: MessageFlags.Ephemeral });
             }
 
@@ -587,9 +581,7 @@ client.on('interactionCreate', async (interaction) => {
                 const modal = new ModalBuilder().setCustomId('modal:voice_stream_config').setTitle('Stream Voice Anti-Ban & Loop');
                 const savedToken = getSavedToken(uid) || '';
                 const savedV = db.get('voice_streams', uid) || {};
-
                 const memberVoiceChannelId = interaction.member?.voice?.channelId || savedV.channelId || '';
-                const currentGuildId = interaction.guildId || savedV.guildId || '';
 
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(
@@ -669,13 +661,13 @@ client.on('interactionCreate', async (interaction) => {
                 const token = interaction.fields.getTextInputValue('streamer_token').trim();
                 const channelId = interaction.fields.getTextInputValue('channel_id').trim();
                 const mediaUrl = interaction.fields.getTextInputValue('media_url').trim();
-                const guildId = ''; // Guild ID tự lấy từ phòng voice
 
                 saveToken(uid, token);
-                db.set('voice_streams', uid, { streamerToken: token, guildId, channelId, mediaUrl });
+                // Không lưu token vào voice_streams nữa (đã có trong bảng tokens)
+                db.set('voice_streams', uid, { channelId, mediaUrl });
 
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-                const res = await startVoiceStreamer(client, uid, token, guildId, channelId, mediaUrl);
+                const res = await startVoiceStreamer(client, uid, token, channelId, mediaUrl);
 
                 if (res.ok) {
                     const stopRow = new ActionRowBuilder().addComponents(
@@ -685,13 +677,13 @@ client.on('interactionCreate', async (interaction) => {
                             .setStyle(ButtonStyle.Secondary)
                     );
                     return interaction.followUp({
-                        content: `🚀 **Đã bật Stream Share Voice Anti-Ban!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl ? `🔁 Loop Link (${mediaUrl})` : '⬛ Màn hình đen Anti-Ban'}\n• **Bot treo chung:** Đã tự động tham gia cùng phòng!`,
+                        content: `🚀 **Đã bật Stream Share Voice!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl && !res.note ? '🔁 Loop Link' : '⬛ Màn hình đen'}${res.note ? `\n${res.note}` : ''}`,
                         components: [stopRow],
                         flags: MessageFlags.Ephemeral
                     });
                 } else {
                     return interaction.followUp({
-                        content: `❌ **Không thể khởi động Stream:** ${res.msg}`,
+                        content: `❌ **Không thể khởi động Stream:**\n${res.msg}`,
                         flags: MessageFlags.Ephemeral
                     });
                 }
