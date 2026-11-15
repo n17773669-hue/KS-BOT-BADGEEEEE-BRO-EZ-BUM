@@ -19,6 +19,7 @@ const VIDEO = { width: 1280, height: 720, fps: 15, bitrate: '600k' };
 
 let finished = false;
 let streaming = false;
+let endedSent = false;
 
 function send(msg) {
     if (process.send) process.send(msg);
@@ -29,6 +30,13 @@ function fail(code, text) {
     finished = true;
     send({ type: 'error', code, text });
     setTimeout(() => process.exit(1), 500);
+}
+
+// Báo cho bot chính biết phiên đã chết (bot chính sẽ tự treo lại). Chỉ báo 1 lần.
+function reportEnded(reason) {
+    if (endedSent) return;
+    endedSent = true;
+    send({ type: 'ended', reason });
 }
 
 function withTimeout(promise, ms, label) {
@@ -45,6 +53,7 @@ process.on('disconnect', () => process.exit(0));
 process.on('uncaughtException', (e) => {
     console.error('[stream] uncaughtException:', e);
     if (!streaming) fail('CRASH', `❌ Lỗi không mong muốn: ${e.message}`);
+    else reportEnded(`lỗi không mong muốn: ${e.message}`);
 });
 process.on('unhandledRejection', (e) => {
     console.error('[stream] unhandledRejection:', e);
@@ -151,13 +160,26 @@ if (!TOKEN || !CHANNEL_ID) {
             ffmpeg.on('error', (e) => {
                 console.error('[stream] ffmpeg lỗi:', e);
                 if (!streaming) fail('FFMPEG', `❌ ffmpeg lỗi: ${e.message}`);
-                else send({ type: 'ended', reason: `ffmpeg lỗi: ${e.message}` });
+                else reportEnded(`ffmpeg lỗi: ${e.message}`);
+            });
+            // ffmpeg tự thoát (link video chết, v.v.) -> để bot chính treo lại
+            ffmpeg.on('close', () => {
+                if (streaming) reportEnded('ffmpeg đã dừng');
             });
 
             streaming = true;
             finished = true;
             console.log('[+] Stream đang chạy ngầm ổn định!');
             send({ type: 'ready', channelName: channel.name });
+
+            // Bị kick / bị kéo sang phòng khác / mất kết nối voice -> báo bot chính để vào lại
+            client.on('voiceStateUpdate', (oldState, newState) => {
+                if (!streaming) return;
+                if (!newState || newState.id !== client.user.id) return;
+                if (newState.channelId !== CHANNEL_ID) {
+                    reportEnded(newState.channelId ? 'bị chuyển sang phòng voice khác' : 'bị văng khỏi phòng voice');
+                }
+            });
         } catch (error) {
             console.error('[-] Có lỗi xảy ra khi stream:', error);
             fail('ERROR', `❌ Lỗi khi stream: ${error.message}`);
