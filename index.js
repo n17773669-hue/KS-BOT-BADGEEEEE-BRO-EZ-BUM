@@ -68,7 +68,6 @@ const HYPESQUAD_BADGES = {
     }
 };
 
-// Lưu trữ tiến trình stream theo userId: { selfClient, ffmpeg, guildId, channelId }
 const activeVoiceStreamers = new Map();
 let cachedBuildNumber = 504649;
 
@@ -195,7 +194,6 @@ const db = new DiscordCloudDB();
 async function resolveMediaSource(mediaUrl) {
     if (!mediaUrl || !/^https?:\/\//i.test(mediaUrl)) return null;
 
-    // 1. Link Pinterest
     if (/pinterest\.com|pin\.it/i.test(mediaUrl)) {
         try {
             const res = await axios.get(mediaUrl, {
@@ -204,7 +202,7 @@ async function resolveMediaSource(mediaUrl) {
                 headers: { 'User-Agent': DEVICE_PROFILES[0].ua }
             });
             const html = String(res.data || '');
-            const mp4Matches = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s\]+\.mp4/gi) || [];
+            const mp4Matches = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s]+\.mp4/gi) || [];
             const bestMp4 = mp4Matches.find(u => u.includes('720p')) || mp4Matches[0] || null;
             const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
             return {
@@ -217,21 +215,11 @@ async function resolveMediaSource(mediaUrl) {
         }
     }
 
-    // 2. Link trực tiếp .mp4 / .m3u8
     if (/\.(mp4|webm|mkv|m3u8)(\?.*)?$/i.test(mediaUrl)) {
         return {
             type: 'direct',
             streamUrl: mediaUrl,
             title: 'Direct Media Loop'
-        };
-    }
-
-    // 3. Link YouTube (Tách stream qua ytdl / pipe nếu có, hoặc fallback)
-    if (/youtube\.com|youtu\.be/i.test(mediaUrl)) {
-        return {
-            type: 'youtube',
-            streamUrl: mediaUrl,
-            title: 'YouTube Video Loop'
         };
     }
 
@@ -252,7 +240,6 @@ async function stopVoiceStreamer(botClient, userId) {
         if (active.selfClient) {
             try { active.selfClient.destroy(); } catch (e) {}
         }
-        // Bot chính cũng rời khỏi phòng voice nếu đang treo chung
         if (active.guildId && botClient) {
             const guild = botClient.guilds.cache.get(active.guildId);
             if (guild && guild.shard) {
@@ -277,7 +264,6 @@ async function stopVoiceStreamer(botClient, userId) {
 async function startVoiceStreamer(botClient, userId, streamerToken, guildId, channelId, mediaUrl = '') {
     if (!channelId || !streamerToken) return { ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" };
 
-    // Dừng phiên cũ nếu đang chạy
     await stopVoiceStreamer(botClient, userId);
 
     try {
@@ -299,7 +285,6 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 }
                 sessionObj.guildId = targetGuildId;
 
-                // 1. Cho Bot chính vô treo voice chung nếu chung server
                 const botGuild = botClient.guilds.cache.get(targetGuildId);
                 if (botGuild && botGuild.shard) {
                     botGuild.shard.send({
@@ -314,7 +299,6 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                     console.log(`[BotVoice] Bot chính đã vào treo chung phòng [${channelId}]!`);
                 }
 
-                // 2. Selfbot vào voice và bật share màn hình
                 const streamer = new Streamer(selfClient);
                 await streamer.joinVoice(targetGuildId, channelId);
 
@@ -330,12 +314,10 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
 
                 const udpStream = await streamer.createStream();
 
-                // 3. Xác định nguồn phát Loop (Pinterest / Direct MP4 / Màn hình đen Anti-Ban)
                 let resolved = mediaUrl ? await resolveMediaSource(mediaUrl) : null;
                 let ffmpegArgs = [];
 
-                if (resolved && resolved.streamUrl && resolved.type !== 'youtube') {
-                    // Phát lặp vô tận video Pinterest / MP4
+                if (resolved && resolved.streamUrl) {
                     ffmpegArgs = [
                         '-re',
                         '-stream_loop', '-1',
@@ -353,7 +335,6 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                         udpStream
                     ];
                 } else {
-                    // Mặc định: Màn hình đen Anti-Ban siêu nhẹ (15fps, 600kbps)
                     ffmpegArgs = [
                         '-f', 'lavfi',
                         '-i', 'color=c=black:s=1280x720:r=15',
@@ -439,8 +420,7 @@ function buildDashboard() {
                     components: [
                         {
                             type: 10,
-                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽
-Chọn tính năng bạn muốn sử dụng bên dưới (Hỗ trợ phát Loop Pinterest & Bot treo chung):"
+                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽\nChọn tính năng bạn muốn sử dụng bên dưới (Hỗ trợ phát Loop Pinterest & Bot treo chung):"
                         }
                     ],
                     accessory: { type: 11, media: { url: DEFAULT_THUMBNAIL } }
@@ -492,7 +472,6 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
     try {
-        // Xử lý Slash Commands
         if (interaction.isChatInputCommand()) {
             const uid = interaction.user.id;
 
@@ -511,7 +490,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // Xử lý Button Clicks
         if (interaction.isButton()) {
             const [, , action] = interaction.customId.split(':');
             const uid = interaction.user.id;
@@ -521,7 +499,6 @@ client.on('interactionCreate', async (interaction) => {
                 const savedToken = getSavedToken(uid) || '';
                 const savedV = db.get('voice_streams', uid) || {};
 
-                // Tự động lấy Voice Channel ID nếu người dùng đang ngồi sẵn trong phòng Voice của server!
                 const memberVoiceChannelId = interaction.member?.voice?.channelId || savedV.channelId || '';
                 const currentGuildId = interaction.guildId || savedV.guildId || '';
 
@@ -598,7 +575,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // Xử lý Modal Submit
         if (interaction.isModalSubmit()) {
             const uid = interaction.user.id;
 
@@ -628,10 +604,7 @@ client.on('interactionCreate', async (interaction) => {
                             .setStyle(ButtonStyle.Secondary)
                     );
                     return interaction.followUp({
-                        content: `🚀 **Đã bật Stream Share Voice Anti-Ban!**
-• **Phòng Voice:** <#${channelId}>
-• **Chế độ phát:** ${mediaUrl ? `🔁 Loop Link (${mediaUrl})` : '⬛ Màn hình đen Anti-Ban'}
-• **Bot treo chung:** Đã tự động tham gia cùng phòng!`,
+                        content: `🚀 **Đã bật Stream Share Voice Anti-Ban!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl ? `🔁 Loop Link (${mediaUrl})` : '⬛ Màn hình đen Anti-Ban'}\n• **Bot treo chung:** Đã tự động tham gia cùng phòng!`,
                         components: [stopRow],
                         ephemeral: true
                     });
@@ -644,7 +617,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // Xử lý chọn HypeSquad
         if (interaction.isButton() && interaction.customId.startsWith('hs:')) {
             const [, houseIdStr, ownerId] = interaction.customId.split(':');
             if (interaction.user.id !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
@@ -659,8 +631,7 @@ client.on('interactionCreate', async (interaction) => {
             if (res.status === 204 || res.status === 200) {
                 const successEmbed = new EmbedBuilder()
                     .setTitle(`🎉 Đã gia nhập thành công ${houseInfo.name}!`)
-                    .setDescription(`Huy hiệu của bạn đã được cập nhật.
-*Mô tả:* ${houseInfo.desc}`)
+                    .setDescription(`Huy hiệu của bạn đã được cập nhật.\n*Mô tả:* ${houseInfo.desc}`)
                     .setImage(houseInfo.badgeUrl)
                     .setColor(0x2B2D31);
                 return interaction.update({ embeds: [successEmbed], components: [] });
