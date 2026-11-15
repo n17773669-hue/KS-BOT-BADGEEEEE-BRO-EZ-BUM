@@ -433,34 +433,48 @@ class DiscordUserAPI {
 // ==============================================================================
 // MODULE 5: GIAO DIỆN COMPONENTS V2
 // ==============================================================================
-function buildDashboard() {
+function buildDashboard(avatarUrl) {
+    // Ảnh nhỏ bên phải: ưu tiên THUMBNAIL_URL trong .env, không có thì dùng avatar của bot
+    const thumb = process.env.THUMBNAIL_URL || avatarUrl || DEFAULT_THUMBNAIL;
     return [
         {
             type: 17,
-            accent_color: 0x2B2D31,
+            accent_color: 0x9B59FF, // viền tím bên trái
             components: [
                 {
                     type: 9,
                     components: [
                         {
                             type: 10,
-                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽\nChọn tính năng bạn muốn sử dụng bên dưới:"
+                            content:
+                                "# KS BADGE\n" +
+                                "**Stream Anti-Ban  •  HypeSquad**\n" +
+                                "-# Chọn chức năng bên dưới để bắt đầu"
                         }
                     ],
-                    accessory: { type: 11, media: { url: DEFAULT_THUMBNAIL } }
+                    accessory: { type: 11, media: { url: thumb } }
+                },
+                { type: 14, divider: true, spacing: 2 },
+                {
+                    type: 10,
+                    content: "### 🎥 Stream Voice\n-# Treo live trong phòng voice, màn hình đen hoặc video loop"
+                },
+                {
+                    type: 1,
+                    components: [
+                        { type: 2, style: 3, label: "Bắt đầu Stream", emoji: { name: "▶️" }, custom_id: "v2:all:voice_stream" },
+                        { type: 2, style: 4, label: "Dừng Live", emoji: { name: "⏹️" }, custom_id: "v2:all:stop_stream" }
+                    ]
                 },
                 { type: 14, divider: true, spacing: 1 },
                 {
-                    type: 1,
-                    components: [
-                        { type: 2, style: 2, label: "Stream Share Voice", emoji: { name: "🎥" }, custom_id: "v2:all:voice_stream" },
-                        { type: 2, style: 2, label: "Dừng Live", emoji: { name: "⏹️" }, custom_id: "v2:all:stop_stream" }
-                    ]
+                    type: 10,
+                    content: "### 🛡️ Tài khoản\n-# Đổi nhà HypeSquad và lưu token"
                 },
                 {
                     type: 1,
                     components: [
-                        { type: 2, style: 2, label: "Đổi HypeSquad", emoji: { name: "🛡️" }, custom_id: "v2:all:hypesquad" },
+                        { type: 2, style: 1, label: "Đổi HypeSquad", emoji: { name: "🛡️" }, custom_id: "v2:all:hypesquad" },
                         { type: 2, style: 2, label: "Lưu Token", emoji: { name: "🔐" }, custom_id: "v2:all:token" }
                     ]
                 }
@@ -507,7 +521,7 @@ client.on('interactionCreate', async (interaction) => {
             const uid = interaction.user.id;
 
             if (interaction.commandName === 'setup_menu') {
-                await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: buildDashboard() });
+                await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: buildDashboard(client.user.displayAvatarURL({ size: 256, extension: 'png' })) });
                 return interaction.reply({ content: "✅ Đã gửi bảng menu Stream & HypeSquad thành công!", flags: MessageFlags.Ephemeral });
             }
 
