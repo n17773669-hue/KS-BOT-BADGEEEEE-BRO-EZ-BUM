@@ -233,7 +233,7 @@ async function resolveMediaSource(mediaUrl) {
 }
 
 // ==============================================================================
-// MODULE 3: VOICE STREAMER & BOT TREO CHUNG + DỪNG LIVE
+// MODULE 3: VOICE STREAMER & RUỘT STREAM CHUẨN XÁC
 // ==============================================================================
 async function stopVoiceStreamer(botClient, userId) {
     const active = activeVoiceStreamers.get(userId);
@@ -269,7 +269,7 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
         const sessionObj = { selfClient, ffmpeg: null, guildId, channelId, mediaUrl };
         activeVoiceStreamers.set(userId, sessionObj);
 
-        selfClient.on('ready', async () => {
+        selfClient.on('clientReady', async () => {
             console.log(`[VoiceStream - AntiBan] Selfbot đăng nhập: ${selfClient.user.tag}`);
             try {
                 let targetGuildId = guildId;
@@ -283,6 +283,7 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 }
                 sessionObj.guildId = targetGuildId;
 
+                // Bot chính vào voice chung
                 const botGuild = await botClient.guilds.fetch(targetGuildId).catch(() => null);
                 if (botGuild) {
                     try {
@@ -301,9 +302,14 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                     }
                 }
 
+                // Khởi tạo Streamer đúng chuẩn file mẫu của bạn
                 const streamer = new Streamer(selfClient);
-                await streamer.joinVoice(targetGuildId, channelId);
 
+                console.log("[+] Đang kết nối vào Voice Channel...");
+                await streamer.joinVoice(targetGuildId, channelId);
+                console.log("[+] Đã vào phòng voice thành công!");
+
+                // Khóa cứng Mic (Mute) ngay lập tức
                 await selfClient.ws.broadcast({
                     op: 4,
                     d: {
@@ -313,7 +319,9 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                         self_deaf: false
                     }
                 });
+                console.log("[+] Đã khóa cứng Mic (Mute) thành công!");
 
+                console.log("[+] Đang khởi tạo luồng stream...");
                 const udpStream = await streamer.createStream();
 
                 let resolved = mediaUrl ? await resolveMediaSource(mediaUrl) : null;
@@ -329,9 +337,9 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                         '-vcodec', 'libx264',
                         '-preset', 'ultrafast',
                         '-tune', 'zerolatency',
-                        '-r', '20',
-                        '-g', '40',
-                        '-b:v', '900k',
+                        '-r', '30',
+                        '-g', '60',
+                        '-b:v', '1000k',
                         '-an',
                         '-f', 'rtsp',
                         udpStream
@@ -339,14 +347,14 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 } else {
                     ffmpegArgs = [
                         '-f', 'lavfi',
-                        '-i', 'color=c=black:s=1280x720:r=15',
+                        '-i', 'color=c=black:s=1280x720:r=30',
                         '-pix_fmt', 'yuv420p',
                         '-vcodec', 'libx264',
                         '-preset', 'ultrafast',
                         '-tune', 'zerolatency',
-                        '-r', '15',
-                        '-g', '30',
-                        '-b:v', '600k',
+                        '-r', '30',
+                        '-g', '60',
+                        '-b:v', '1000k',
                         '-f', 'rtsp',
                         udpStream
                     ];
@@ -355,7 +363,7 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 const ffmpegProc = new prism.FFmpeg({ args: ffmpegArgs });
                 sessionObj.ffmpeg = ffmpegProc;
 
-                console.log(`[VoiceStream] Đã bật stream thành công!`);
+                console.log(`[VoiceStream] Stream màn hình đang chạy ngầm ổn định tuyệt đối!`);
             } catch (err) {
                 console.error(`[VoiceStream] Lỗi luồng stream:`, err.message);
             }
@@ -409,7 +417,7 @@ class DiscordUserAPI {
 }
 
 // ==============================================================================
-// MODULE 5: GIAO DIỆN COMPONENTS V2 (CHIA 2 HÀNG GỌN GÀNG, KHÔNG BỊ TRÀN)
+// MODULE 5: GIAO DIỆN COMPONENTS V2 (2 HÀNG CÂN ĐỐI)
 // ==============================================================================
 function buildDashboard() {
     return [
@@ -459,7 +467,7 @@ const client = new Client({
     ]
 });
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`[+] Bot đã đăng nhập: ${client.user.tag}`);
     await fetchLatestBuildNumber();
     await db.init(client);
@@ -485,15 +493,15 @@ client.on('interactionCreate', async (interaction) => {
 
             if (interaction.commandName === 'setup_menu') {
                 await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: buildDashboard() });
-                return interaction.reply({ content: "✅ Đã gửi bảng menu Stream & HypeSquad thành công!", ephemeral: true });
+                return interaction.reply({ content: "✅ Đã gửi bảng menu Stream & HypeSquad thành công!", flags: MessageFlags.Ephemeral });
             }
 
             if (interaction.commandName === 'dung_live') {
                 const stopped = await stopVoiceStreamer(client, uid);
                 if (stopped) {
-                    return interaction.reply({ content: "⏹️ **Đã dừng phiên Stream Share Voice** và cho Bot + Tài khoản rời phòng voice an toàn!", ephemeral: true });
+                    return interaction.reply({ content: "⏹️ **Đã dừng phiên Stream Share Voice** và cho Bot + Tài khoản rời phòng voice an toàn!", flags: MessageFlags.Ephemeral });
                 } else {
-                    return interaction.reply({ content: "ℹ️ Bạn hiện không có phiên Stream Voice nào đang chạy.", ephemeral: true });
+                    return interaction.reply({ content: "ℹ️ Bạn hiện không có phiên Stream Voice nào đang chạy.", flags: MessageFlags.Ephemeral });
                 }
             }
         }
@@ -551,9 +559,9 @@ client.on('interactionCreate', async (interaction) => {
             if (action === 'stop_stream') {
                 const stopped = await stopVoiceStreamer(client, uid);
                 if (stopped) {
-                    return interaction.reply({ content: "⏹️ **Đã tắt Live Share Màn Hình** và cho Bot + Tài khoản rời khỏi Voice Channel!", ephemeral: true });
+                    return interaction.reply({ content: "⏹️ **Đã tắt Live Share Màn Hình** và cho Bot + Tài khoản rời khỏi Voice Channel!", flags: MessageFlags.Ephemeral });
                 } else {
-                    return interaction.reply({ content: "ℹ️ Hiện tại bạn chưa bật phiên Live nào.", ephemeral: true });
+                    return interaction.reply({ content: "ℹ️ Hiện tại bạn chưa bật phiên Live nào.", flags: MessageFlags.Ephemeral });
                 }
             }
 
@@ -579,7 +587,7 @@ client.on('interactionCreate', async (interaction) => {
                     new ButtonBuilder().setCustomId(`hs:2:${uid}`).setLabel("Brilliance (Sáng suốt)").setStyle(ButtonStyle.Secondary),
                     new ButtonBuilder().setCustomId(`hs:3:${uid}`).setLabel("Balance (Cân bằng)").setStyle(ButtonStyle.Secondary)
                 );
-                return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+                return interaction.reply({ embeds: [embed], components: [row], flags: MessageFlags.Ephemeral });
             }
         }
 
@@ -589,7 +597,7 @@ client.on('interactionCreate', async (interaction) => {
             if (interaction.customId === 'modal:token') {
                 const token = interaction.fields.getTextInputValue('token_val').trim();
                 saveToken(uid, token);
-                return interaction.reply({ content: "✅ Đã lưu User Token thành công!", ephemeral: true });
+                return interaction.reply({ content: "✅ Đã lưu User Token thành công!", flags: MessageFlags.Ephemeral });
             }
 
             if (interaction.customId === 'modal:voice_stream_config') {
@@ -601,7 +609,7 @@ client.on('interactionCreate', async (interaction) => {
                 saveToken(uid, token);
                 db.set('voice_streams', uid, { streamerToken: token, guildId, channelId, mediaUrl });
 
-                await interaction.deferReply({ ephemeral: true });
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
                 const res = await startVoiceStreamer(client, uid, token, guildId, channelId, mediaUrl);
 
                 if (res.ok) {
@@ -614,12 +622,12 @@ client.on('interactionCreate', async (interaction) => {
                     return interaction.followUp({
                         content: `🚀 **Đã bật Stream Share Voice Anti-Ban!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl ? `🔁 Loop Link (${mediaUrl})` : '⬛ Màn hình đen Anti-Ban'}\n• **Bot treo chung:** Đã tự động tham gia cùng phòng!`,
                         components: [stopRow],
-                        ephemeral: true
+                        flags: MessageFlags.Ephemeral
                     });
                 } else {
                     return interaction.followUp({
                         content: `❌ **Không thể khởi động Stream:** ${res.msg}`,
-                        ephemeral: true
+                        flags: MessageFlags.Ephemeral
                     });
                 }
             }
@@ -627,9 +635,9 @@ client.on('interactionCreate', async (interaction) => {
 
         if (interaction.isButton() && interaction.customId.startsWith('hs:')) {
             const [, houseIdStr, ownerId] = interaction.customId.split(':');
-            if (interaction.user.id !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
+            if (interaction.user.id !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", flags: MessageFlags.Ephemeral });
             const token = getSavedToken(ownerId);
-            if (!token) return interaction.reply({ content: "❌ Bạn chưa lưu Token trên hệ thống! Vui lòng bấm 'Lưu Token' trước.", ephemeral: true });
+            if (!token) return interaction.reply({ content: "❌ Bạn chưa lưu Token trên hệ thống! Vui lòng bấm 'Lưu Token' trước.", flags: MessageFlags.Ephemeral });
 
             const houseId = parseInt(houseIdStr, 10);
             const houseInfo = HYPESQUAD_BADGES[houseId];
