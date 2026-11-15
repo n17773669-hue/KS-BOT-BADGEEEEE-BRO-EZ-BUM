@@ -133,7 +133,7 @@ class DiscordCloudDB {
         const allChannels = await guild.channels.fetch().catch(() => null);
         if (!allChannels) return;
 
-        let category = allChannels.find(c => c.type === ChannelType.GuildCategory && c.name === 'BOT-CLOUD-DB');
+        let category = allChannels.find(c => c && c.type === ChannelType.GuildCategory && c.name === 'BOT-CLOUD-DB');
         if (!category) {
             category = await guild.channels.create({
                 name: 'BOT-CLOUD-DB',
@@ -144,7 +144,7 @@ class DiscordCloudDB {
 
         // Kênh lưu token + trạng thái treo
         for (const [table, chName] of Object.entries(CLOUD_TABLES)) {
-            let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
+            let channel = allChannels.find(c => c && c.type === ChannelType.GuildText && c.name === chName);
             if (!channel && category) {
                 channel = await guild.channels.create({
                     name: chName,
@@ -162,7 +162,7 @@ class DiscordCloudDB {
         if (!fs.existsSync(PURGE_MARKER)) {
             console.log('[DB] Đang xóa tin nhắn các kênh DB cũ...');
             for (const chName of PURGE_CHANNELS) {
-                const ch = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
+                const ch = allChannels.find(c => c && c.type === ChannelType.GuildText && c.name === chName);
                 if (ch) {
                     const n = await purgeChannel(ch);
                     console.log(`[DB] ${chName}: đã xóa ${n} tin nhắn`);
