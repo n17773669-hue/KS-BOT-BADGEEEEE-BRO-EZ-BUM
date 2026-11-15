@@ -30,12 +30,21 @@ const DB_GUILD_ID = process.env.DB_GUILD_ID || '1571370887683375124';
 const DEFAULT_THUMBNAIL = process.env.THUMBNAIL_URL || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop';
 const STREAM_SCRIPT = path.join(__dirname, 'stream.js');
 
+// Tự treo lại khi bị văng voice / tiến trình chết
+const MAX_AUTO_RESTARTS = 5;          // số lần thử lại liên tiếp tối đa
+const RESTART_BASE_DELAY = 10000;     // 10s, 20s, 30s... tối đa 60s
+const STABLE_UPTIME_MS = 5 * 60000;   // chạy ổn định > 5 phút thì reset bộ đếm
+const RESTORE_STAGGER_MS = 4000;      // giãn cách giữa các phiên khi khởi động lại bot
+// Lỗi "chết hẳn" (token sai, phòng không tồn tại...) thì không thử lại
+const FATAL_CODES = new Set(['TOKEN_INVALID', 'NO_CHANNEL', 'NOT_VOICE', 'BAD_INPUT']);
+
 const LOCAL_CACHE_DIR = path.join(__dirname, 'cache_db');
 if (!fs.existsSync(LOCAL_CACHE_DIR)) fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
 
-// Chỉ còn bảng "tokens" được lưu lên Discord (kênh db-tokens).
-// "voice_streams" chỉ lưu file local để điền sẵn form, không đẩy lên Discord.
-const CLOUD_TABLES = { tokens: 'db-tokens' };
+// Railway có ổ đĩa tạm (mất sau mỗi lần deploy) nên CẢ 2 bảng đều phải đẩy lên Discord:
+//  - tokens: token từng user
+//  - voice_streams: phòng, link video, và cờ "active" (đang treo hay đã bấm dừng)
+const CLOUD_TABLES = { tokens: 'db-tokens', voice_streams: 'db-live' };
 const LOCAL_TABLES = ['tokens', 'voice_streams'];
 // Các kênh cũ sẽ bị XÓA SẠCH TIN NHẮN 1 lần duy nhất (token ở db-tokens được giữ nguyên)
 const PURGE_CHANNELS = ['db-fingerprints', 'db-sessions', 'db-setups', 'db-voice-streams'];
@@ -69,10 +78,13 @@ const HYPESQUAD_BADGES = {
 };
 
 const activeVoiceStreamers = new Map();
+const restartState = new Map(); // userId -> { tries, timer }
 let cachedBuildNumber = 504649;
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
 // ==============================================================================
-// MODULE 1: LƯU TRỮ (nhẹ) - tokens đồng bộ lên Discord, phần còn lại lưu local
+// MODULE 1: LƯU TRỮ - tokens + voice_streams đồng bộ lên Discord
 // ==============================================================================
 async function purgeChannel(channel) {
     let total = 0;
@@ -130,7 +142,7 @@ class DiscordCloudDB {
             }).catch(() => null);
         }
 
-        // Kênh lưu token
+        // Kênh lưu token + trạng thái treo
         for (const [table, chName] of Object.entries(CLOUD_TABLES)) {
             let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
             if (!channel && category) {
@@ -241,6 +253,12 @@ class DiscordCloudDB {
 
 const db = new DiscordCloudDB();
 
+// Cập nhật trạng thái treo của 1 user (giữ nguyên channelId/mediaUrl để điền sẵn form)
+function persistLive(userId, patch) {
+    const cur = db.get('voice_streams', userId) || {};
+    db.set('voice_streams', userId, { ...cur, ...patch });
+}
+
 // ==============================================================================
 // MODULE 2: RESOLVE LINK PINTEREST / DIRECT MP4
 // ==============================================================================
@@ -303,9 +321,28 @@ function botLeaveVoiceIfIdle(botClient, guildId, exceptUserId) {
     } catch (e) {}
 }
 
-async function stopVoiceStreamer(botClient, userId) {
+function cancelRestart(userId) {
+    const st = restartState.get(userId);
+    if (st && st.timer) clearTimeout(st.timer);
+    restartState.delete(userId);
+    return !!(st && st.timer);
+}
+
+// manual = true  -> người dùng chủ động bấm dừng: đặt active=false, SẼ KHÔNG tự treo lại nữa
+// manual = false -> chỉ dọn tiến trình (dùng nội bộ khi restart / lỗi), giữ nguyên active
+async function stopVoiceStreamer(botClient, userId, manual = true) {
+    let hadPending = false;
+    if (manual) {
+        hadPending = cancelRestart(userId);
+        const live = db.get('voice_streams', userId);
+        if (live && live.active) {
+            persistLive(userId, { active: false });
+            hadPending = true;
+        }
+    }
+
     const active = activeVoiceStreamers.get(userId);
-    if (!active) return false;
+    if (!active) return hadPending;
 
     active.stopping = true;
     try { active.child.kill('SIGKILL'); } catch (e) {}
@@ -313,17 +350,81 @@ async function stopVoiceStreamer(botClient, userId) {
     botLeaveVoiceIfIdle(botClient, active.guildId, userId);
 
     activeVoiceStreamers.delete(userId);
-    db.delete('voice_streams', userId);
     return true;
 }
 
-function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUrl = '', onProgress = null) {
-    return new Promise(async (resolve) => {
-        if (!channelId || !streamerToken) return resolve({ ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" });
-        if (!/^\d{15,22}$/.test(channelId)) return resolve({ ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" });
-        if (!fs.existsSync(STREAM_SCRIPT)) return resolve({ ok: false, msg: "Thiếu file stream.js cạnh file bot! Hãy upload cả 2 file vào cùng thư mục." });
+// Tự thử treo lại sau khi bị văng / tiến trình chết
+function scheduleRestart(botClient, userId, reason) {
+    const live = db.get('voice_streams', userId);
+    if (!live || !live.active || !getSavedToken(userId)) return; // đã bấm dừng hoặc không còn token
 
-        await stopVoiceStreamer(botClient, userId);
+    const st = restartState.get(userId) || { tries: 0, timer: null };
+    if (st.timer) return;
+
+    if (st.tries >= MAX_AUTO_RESTARTS) {
+        restartState.delete(userId);
+        persistLive(userId, { active: false });
+        notifyUser(botClient, userId, `❌ Bot đã thử treo lại ${MAX_AUTO_RESTARTS} lần nhưng không được (${reason || 'không rõ lý do'}). Mình dừng tự treo, bạn bấm "Bắt đầu Stream" để bật lại nhé.`);
+        return;
+    }
+
+    st.tries++;
+    const delay = Math.min(RESTART_BASE_DELAY * st.tries, 60000);
+    console.log(`[AutoRestart] ${userId}: thử lại lần ${st.tries}/${MAX_AUTO_RESTARTS} sau ${delay / 1000}s (${reason})`);
+    st.timer = setTimeout(() => {
+        st.timer = null;
+        autoStart(botClient, userId);
+    }, delay);
+    restartState.set(userId, st);
+}
+
+// Bật lại phiên đã lưu (dùng cho cả lúc khởi động lại bot và lúc tự vào lại)
+async function autoStart(botClient, userId) {
+    const live = db.get('voice_streams', userId);
+    if (!live || !live.active) return;            // đã bấm dừng -> bỏ qua, không kiểm tra token
+    const token = getSavedToken(userId);
+    if (!token || !live.channelId) {
+        persistLive(userId, { active: false });
+        return;
+    }
+
+    const res = await startVoiceStreamer(botClient, userId, token, live.channelId, live.mediaUrl || '', null, true);
+    if (res.ok) {
+        console.log(`[AutoStart] ${userId}: đã treo lại thành công.`);
+        return;
+    }
+
+    // Có thể trong lúc đang khởi động user đã bấm dừng
+    const now = db.get('voice_streams', userId);
+    if (!now || !now.active) return;
+
+    if (FATAL_CODES.has(res.code)) {
+        persistLive(userId, { active: false });
+        cancelRestart(userId);
+        notifyUser(botClient, userId, `❌ Không tự treo lại được và đã hủy: ${res.msg}`);
+        return;
+    }
+    scheduleRestart(botClient, userId, res.msg);
+}
+
+function handleUnexpectedEnd(botClient, userId, sess, reason) {
+    if (activeVoiceStreamers.get(userId) !== sess || sess.stopping) return;
+    // Chạy ổn định đủ lâu thì coi như lần lỗi mới, reset bộ đếm
+    if (sess.readyAt && Date.now() - sess.readyAt > STABLE_UPTIME_MS) restartState.delete(userId);
+    stopVoiceStreamer(botClient, userId, false);
+    console.log(`[VoiceStream] ${userId} dừng bất ngờ: ${reason}`);
+    scheduleRestart(botClient, userId, reason);
+}
+
+// silent = true: chạy tự động (không DM mỗi lần thất bại, không đụng tới cờ active)
+function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUrl = '', onProgress = null, silent = false) {
+    return new Promise(async (resolve) => {
+        if (!channelId || !streamerToken) return resolve({ ok: false, code: 'BAD_INPUT', msg: "Thiếu Token hoặc Voice Channel ID!" });
+        if (!/^\d{15,22}$/.test(channelId)) return resolve({ ok: false, code: 'BAD_INPUT', msg: "Voice Channel ID không hợp lệ (phải toàn số)!" });
+        if (!fs.existsSync(STREAM_SCRIPT)) return resolve({ ok: false, code: 'BAD_INPUT', msg: "Thiếu file stream.js cạnh file bot! Hãy upload cả 2 file vào cùng thư mục." });
+
+        // Chỉ dọn tiến trình cũ, không đụng tới cờ active
+        await stopVoiceStreamer(botClient, userId, false);
 
         // Lấy link video thật (nếu có)
         let streamUrl = '';
@@ -342,26 +443,29 @@ function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUr
             stdio: ['ignore', 'inherit', 'inherit', 'ipc']
         });
 
-        const sess = { child, guildId: null, channelId, stopping: false };
+        const sess = { child, guildId: null, channelId, stopping: false, readyAt: 0 };
         if (onProgress) onProgress('login');
         activeVoiceStreamers.set(userId, sess);
 
         let finished = false;
         let overallTimer;
 
-        const done = async (ok, msg) => {
+        const done = async (ok, msg, code) => {
             if (finished) return;
             finished = true;
             clearTimeout(overallTimer);
-            if (!ok) {
+            if (ok) {
+                sess.readyAt = Date.now();
+                persistLive(userId, { channelId, mediaUrl, guildId: sess.guildId, active: true });
+            } else {
                 console.error('[VoiceStream] THẤT BẠI:', msg);
-                if (activeVoiceStreamers.get(userId) === sess) await stopVoiceStreamer(botClient, userId);
-                await notifyUser(botClient, userId, msg);
+                if (activeVoiceStreamers.get(userId) === sess) await stopVoiceStreamer(botClient, userId, false);
+                if (!silent) await notifyUser(botClient, userId, msg);
             }
-            resolve({ ok, msg, note });
+            resolve({ ok, msg, note, code });
         };
 
-        overallTimer = setTimeout(() => done(false, '❌ Khởi động stream quá lâu (180s), đã hủy.'), 180000);
+        overallTimer = setTimeout(() => done(false, '❌ Khởi động stream quá lâu (180s), đã hủy.', 'START_TIMEOUT'), 180000);
 
         child.on('message', (m) => {
             if (!m || !m.type) return;
@@ -388,32 +492,46 @@ function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUr
                 }
                 done(true, `Đã vào phòng **${m.channelName || channelId}**`);
             } else if (m.type === 'error') {
-                done(false, m.text);
+                done(false, m.text, m.code);
             } else if (m.type === 'ended') {
-                if (activeVoiceStreamers.get(userId) === sess && !sess.stopping) {
-                    stopVoiceStreamer(botClient, userId);
-                    notifyUser(botClient, userId, `⚠️ Phiên stream đã dừng bất ngờ: ${m.reason || 'không rõ lý do'}`);
-                }
+                handleUnexpectedEnd(botClient, userId, sess, m.reason || 'không rõ lý do');
             }
         });
 
         child.on('exit', (code) => {
             if (sess.stopping) return;
             if (!finished) {
-                done(false, `❌ Tiến trình stream bị tắt đột ngột (code ${code}). Có thể hosting hết RAM.`);
-            } else if (activeVoiceStreamers.get(userId) === sess) {
-                stopVoiceStreamer(botClient, userId);
-                notifyUser(botClient, userId, `⚠️ Phiên stream đã dừng bất ngờ (code ${code}). Có thể hosting hết RAM, hãy bật lại.`);
+                done(false, `❌ Tiến trình stream bị tắt đột ngột (code ${code}). Có thể hosting hết RAM.`, 'CRASH');
+            } else {
+                handleUnexpectedEnd(botClient, userId, sess, `tiến trình thoát (code ${code})`);
             }
         });
 
         child.on('error', (err) => {
-            done(false, `❌ Không chạy được tiến trình stream: ${err.message}`);
+            done(false, `❌ Không chạy được tiến trình stream: ${err.message}`, 'SPAWN');
         });
     });
 }
 
-// Tắt bot thì tắt luôn các tiến trình stream
+// Sau khi bot khởi động lại: treo lại tất cả phiên đang "active" (người đã bấm dừng thì bỏ qua)
+async function restoreStreams(botClient) {
+    const all = db.get('voice_streams');
+    const ids = Object.keys(all).filter(uid => all[uid] && all[uid].active);
+    if (ids.length === 0) return;
+    console.log(`[Restore] Có ${ids.length} phiên cần treo lại.`);
+
+    for (const uid of ids) {
+        if (!getSavedToken(uid)) {
+            // Không còn token thì không treo được
+            persistLive(uid, { active: false });
+            continue;
+        }
+        autoStart(botClient, uid); // không await: chạy song song, so le nhau để tránh rate limit
+        await sleep(RESTORE_STAGGER_MS);
+    }
+}
+
+// Tắt bot thì tắt luôn các tiến trình stream (cờ active giữ nguyên để lần sau tự treo lại)
 function killAllStreams() {
     for (const s of activeVoiceStreamers.values()) {
         try { s.child.kill('SIGKILL'); } catch (e) {}
@@ -549,6 +667,9 @@ client.once('clientReady', async () => {
 
     const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
     await rest.put(Routes.applicationCommands(process.env.CLIENT_ID || client.user.id), { body: commands }).catch(console.error);
+
+    // Treo lại các phiên đang chạy trước khi bot khởi động lại
+    restoreStreams(client).catch(e => console.error('[Restore] Lỗi:', e));
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -664,8 +785,9 @@ client.on('interactionCreate', async (interaction) => {
                 const mediaUrl = interaction.fields.getTextInputValue('media_url').trim();
 
                 saveToken(uid, token);
-                // Không lưu token vào voice_streams nữa (đã có trong bảng tokens)
-                db.set('voice_streams', uid, { channelId, mediaUrl });
+                // Lưu phòng + link. Cờ active chỉ bật lên khi stream thật sự lên (trong startVoiceStreamer).
+                cancelRestart(uid);
+                persistLive(uid, { channelId, mediaUrl, active: false });
 
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -696,7 +818,7 @@ client.on('interactionCreate', async (interaction) => {
                             .setStyle(ButtonStyle.Secondary)
                     );
                     return interaction.editReply({
-                        content: `🚀 **Đã bật Stream Share Voice!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl && !res.note ? '🔁 Loop Link' : '⬛ Màn hình đen'}${res.note ? `\n${res.note}` : ''}`,
+                        content: `🚀 **Đã bật Stream Share Voice!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl && !res.note ? '🔁 Loop Link' : '⬛ Màn hình đen'}\n• **Tự treo lại** khi bị văng hoặc bot khởi động lại (bấm Dừng để tắt hẳn)${res.note ? `\n${res.note}` : ''}`,
                         components: [stopRow]
                     });
                 } else {
