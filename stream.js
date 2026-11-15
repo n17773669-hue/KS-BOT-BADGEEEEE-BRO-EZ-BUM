@@ -10,12 +10,11 @@ const TOKEN = process.env.STREAM_TOKEN;
 const CHANNEL_ID = process.env.STREAM_CHANNEL_ID;
 const MEDIA_URL = process.env.STREAM_MEDIA_URL || '';
 
-// ===== Cấu hình cho NHẸ (chỉnh ở đây nếu muốn nét hơn) =====
-// Màn hình đen: không cần nét nên để thấp để tiết kiệm CPU/RAM.
-// Nếu stream không lên hình, thử đổi lại 1280x720 / 30fps / 1000k như bản gốc.
-const BLACK = { size: '640x360', fps: 15, bitrate: '250k' };
+// ===== Thông số y hệt bản cũ đã chạy được (1280x720, 15fps, 600k) =====
+// Giữ 15fps cho nhẹ. Không nên hạ độ phân giải vì có thể làm stream không lên hình.
+const BLACK = { size: '1280x720', fps: 15, bitrate: '600k' };
 // Video loop (Pinterest / mp4)
-const VIDEO = { width: 854, height: 480, fps: 24, bitrate: '600k' };
+const VIDEO = { width: 1280, height: 720, fps: 15, bitrate: '600k' };
 // ============================================================
 
 let finished = false;
@@ -81,6 +80,7 @@ if (!TOKEN || !CHANNEL_ID) {
 
             const streamer = new Streamer(client);
 
+            send({ type: 'progress', step: 'joining' });
             console.log('[+] Đang kết nối vào Voice Channel...');
             try {
                 await withTimeout(streamer.joinVoice(guildId, CHANNEL_ID), 20000, 'vào voice');
@@ -88,6 +88,7 @@ if (!TOKEN || !CHANNEL_ID) {
                 console.error(e);
                 return fail('JOIN_TIMEOUT', `❌ Không vào được phòng voice <#${CHANNEL_ID}> (quá 20 giây).\nCó thể acc streamer không có quyền **Kết nối** vào phòng, phòng đã đầy, hoặc phòng bị giới hạn.`);
             }
+            send({ type: 'progress', step: 'joined' });
             console.log('[+] Đã vào phòng voice thành công!');
 
             // Khóa cứng Mic (Mute)
@@ -102,8 +103,15 @@ if (!TOKEN || !CHANNEL_ID) {
             });
             console.log('[+] Đã khóa cứng Mic (Mute) thành công!');
 
-            console.log('[+] Đang khởi tạo luồng stream...');
-            const udpStream = await withTimeout(streamer.createStream(), 20000, 'tạo luồng stream');
+            send({ type: 'progress', step: 'creating' });
+            console.log('[+] Đang khởi tạo luồng stream (có thể mất 30-60s, đợi chút)...');
+            const waitLog = setInterval(() => console.log('[...] vẫn đang chờ Discord cấp luồng stream...'), 15000);
+            let udpStream;
+            try {
+                udpStream = await withTimeout(streamer.createStream(), 120000, 'tạo luồng stream');
+            } finally {
+                clearInterval(waitLog);
+            }
 
             let args;
             if (MEDIA_URL) {
@@ -116,7 +124,6 @@ if (!TOKEN || !CHANNEL_ID) {
                     '-vcodec', 'libx264',
                     '-preset', 'ultrafast',
                     '-tune', 'zerolatency',
-                    '-threads', '1',
                     '-r', String(VIDEO.fps),
                     '-g', String(VIDEO.fps * 2),
                     '-b:v', VIDEO.bitrate,
@@ -132,7 +139,6 @@ if (!TOKEN || !CHANNEL_ID) {
                     '-vcodec', 'libx264',
                     '-preset', 'ultrafast',
                     '-tune', 'zerolatency',
-                    '-threads', '1',
                     '-r', String(BLACK.fps),
                     '-g', String(BLACK.fps * 2),
                     '-b:v', BLACK.bitrate,
