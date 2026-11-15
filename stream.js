@@ -2,6 +2,11 @@
 // Lõi giữ y hệt file index.js chạy được (joinVoice -> mute -> createStream -> ffmpeg).
 // File này được bot.js tự gọi, KHÔNG chạy tay.
 
+// Node < 22 không có WebSocket toàn cục, mà thư viện stream cần -> bù bằng gói "ws"
+if (typeof globalThis.WebSocket === 'undefined') {
+    globalThis.WebSocket = require('ws');
+}
+
 const { Client } = require('discord.js-selfbot-v13');
 const { Streamer } = require('@dank074/discord-video-stream');
 const prism = require('prism-media');
