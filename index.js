@@ -20,7 +20,6 @@ const { Client: SelfClient } = require('discord.js-selfbot-v13');
 const { Streamer } = require('@dank074/discord-video-stream');
 const prism = require('prism-media');
 const axios = require('axios');
-const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 
@@ -202,7 +201,6 @@ async function resolveMediaSource(mediaUrl) {
                 headers: { 'User-Agent': DEVICE_PROFILES[0].ua }
             });
             const html = String(res.data || '');
-            
             let bestMp4 = null;
             let idx = html.indexOf('.pinimg.com/videos/');
             if (idx !== -1) {
@@ -212,7 +210,6 @@ async function resolveMediaSource(mediaUrl) {
                     bestMp4 = html.substring(start, end + 4);
                 }
             }
-
             const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
             return {
                 type: 'pinterest',
@@ -286,30 +283,24 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 }
                 sessionObj.guildId = targetGuildId;
 
-                // Cho Bot chính kết nối vào Voice Channel qua client Discord.js chuẩn
                 const botGuild = await botClient.guilds.fetch(targetGuildId).catch(() => null);
                 if (botGuild) {
-                    const targetChannel = await botGuild.channels.fetch(channelId).catch(() => null);
-                    if (targetChannel && targetChannel.type === ChannelType.GuildVoice) {
-                        try {
-                            // Sử dụng thư viện joinVoiceChannel hoặc gửi payload gateway trực tiếp an toàn
-                            botGuild.shard.send({
-                                op: 4,
-                                d: {
-                                    guild_id: targetGuildId,
-                                    channel_id: channelId,
-                                    self_mute: true,
-                                    self_deaf: true
-                                }
-                            });
-                            console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}] thành công!`);
-                        } catch (err) {
-                            console.error(`[BotVoice] Lỗi bot tham gia voice:`, err.message);
-                        }
+                    try {
+                        botGuild.shard.send({
+                            op: 4,
+                            d: {
+                                guild_id: targetGuildId,
+                                channel_id: channelId,
+                                self_mute: true,
+                                self_deaf: true
+                            }
+                        });
+                        console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}] thành công!`);
+                    } catch (err) {
+                        console.error(`[BotVoice] Lỗi bot tham gia voice:`, err.message);
                     }
                 }
 
-                // Selfbot vào voice và stream
                 const streamer = new Streamer(selfClient);
                 await streamer.joinVoice(targetGuildId, channelId);
 
@@ -418,7 +409,7 @@ class DiscordUserAPI {
 }
 
 // ==============================================================================
-// MODULE 5: GIAO DIỆN COMPONENTS V2
+// MODULE 5: GIAO DIỆN COMPONENTS V2 (CHIA 2 HÀNG GỌN GÀNG, KHÔNG BỊ TRÀN)
 // ==============================================================================
 function buildDashboard() {
     return [
@@ -441,7 +432,12 @@ function buildDashboard() {
                     type: 1,
                     components: [
                         { type: 2, style: 2, label: "Stream Share Voice", emoji: { name: "🎥" }, custom_id: "v2:all:voice_stream" },
-                        { type: 2, style: 2, label: "Dừng Live / Rời Voice", emoji: { name: "⏹️" }, custom_id: "v2:all:stop_stream" },
+                        { type: 2, style: 2, label: "Dừng Live", emoji: { name: "⏹️" }, custom_id: "v2:all:stop_stream" }
+                    ]
+                },
+                {
+                    type: 1,
+                    components: [
                         { type: 2, style: 2, label: "Đổi HypeSquad", emoji: { name: "🛡️" }, custom_id: "v2:all:hypesquad" },
                         { type: 2, style: 2, label: "Lưu Token", emoji: { name: "🔐" }, custom_id: "v2:all:token" }
                     ]
@@ -612,7 +608,7 @@ client.on('interactionCreate', async (interaction) => {
                     const stopRow = new ActionRowBuilder().addComponents(
                         new ButtonBuilder()
                             .setCustomId('v2:all:stop_stream')
-                            .setLabel('⏹️ Dừng Live / Rời Voice Ngay')
+                            .setLabel('⏹️ Dừng Live Ngay')
                             .setStyle(ButtonStyle.Secondary)
                     );
                     return interaction.followUp({
