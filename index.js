@@ -189,7 +189,7 @@ class DiscordCloudDB {
 const db = new DiscordCloudDB();
 
 // ==============================================================================
-// MODULE 2: RESOLVE LINK PINTEREST / YOUTUBE (VIDEO LOOP)
+// MODULE 2: RESOLVE LINK PINTEREST / DIRECT MP4
 // ==============================================================================
 async function resolveMediaSource(mediaUrl) {
     if (!mediaUrl || !/^https?:\/\//i.test(mediaUrl)) return null;
@@ -202,8 +202,17 @@ async function resolveMediaSource(mediaUrl) {
                 headers: { 'User-Agent': DEVICE_PROFILES[0].ua }
             });
             const html = String(res.data || '');
-            const mp4Matches = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s]+\.mp4/gi) || [];
-            const bestMp4 = mp4Matches.find(u => u.includes('720p')) || mp4Matches[0] || null;
+            
+            let bestMp4 = null;
+            let idx = html.indexOf('.pinimg.com/videos/');
+            if (idx !== -1) {
+                let start = html.lastIndexOf('https://', idx);
+                let end = html.indexOf('.mp4', idx);
+                if (start !== -1 && end !== -1) {
+                    bestMp4 = html.substring(start, end + 4);
+                }
+            }
+
             const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
             return {
                 type: 'pinterest',
@@ -242,16 +251,8 @@ async function stopVoiceStreamer(botClient, userId) {
         }
         if (active.guildId && botClient) {
             const guild = botClient.guilds.cache.get(active.guildId);
-            if (guild && guild.shard) {
-                guild.shard.send({
-                    op: 4,
-                    d: {
-                        guild_id: active.guildId,
-                        channel_id: null,
-                        self_mute: false,
-                        self_deaf: false
-                    }
-                });
+            if (guild) {
+                guild.voiceAdapterCreator.destroyConnection(active.guildId);
             }
         }
     } catch (e) {}
@@ -285,20 +286,30 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 }
                 sessionObj.guildId = targetGuildId;
 
-                const botGuild = botClient.guilds.cache.get(targetGuildId);
-                if (botGuild && botGuild.shard) {
-                    botGuild.shard.send({
-                        op: 4,
-                        d: {
-                            guild_id: targetGuildId,
-                            channel_id: channelId,
-                            self_mute: true,
-                            self_deaf: true
+                // Cho Bot chính kết nối vào Voice Channel qua client Discord.js chuẩn
+                const botGuild = await botClient.guilds.fetch(targetGuildId).catch(() => null);
+                if (botGuild) {
+                    const targetChannel = await botGuild.channels.fetch(channelId).catch(() => null);
+                    if (targetChannel && targetChannel.type === ChannelType.GuildVoice) {
+                        try {
+                            // Sử dụng thư viện joinVoiceChannel hoặc gửi payload gateway trực tiếp an toàn
+                            botGuild.shard.send({
+                                op: 4,
+                                d: {
+                                    guild_id: targetGuildId,
+                                    channel_id: channelId,
+                                    self_mute: true,
+                                    self_deaf: true
+                                }
+                            });
+                            console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}] thành công!`);
+                        } catch (err) {
+                            console.error(`[BotVoice] Lỗi bot tham gia voice:`, err.message);
                         }
-                    });
-                    console.log(`[BotVoice] Bot chính đã vào treo chung phòng [${channelId}]!`);
+                    }
                 }
 
+                // Selfbot vào voice và stream
                 const streamer = new Streamer(selfClient);
                 await streamer.joinVoice(targetGuildId, channelId);
 
@@ -353,7 +364,7 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                 const ffmpegProc = new prism.FFmpeg({ args: ffmpegArgs });
                 sessionObj.ffmpeg = ffmpegProc;
 
-                console.log(`[VoiceStream] Đã bật stream (${resolved ? resolved.title : 'Black Screen Anti-Ban'}) thành công!`);
+                console.log(`[VoiceStream] Đã bật stream thành công!`);
             } catch (err) {
                 console.error(`[VoiceStream] Lỗi luồng stream:`, err.message);
             }
@@ -407,7 +418,7 @@ class DiscordUserAPI {
 }
 
 // ==============================================================================
-// MODULE 5: GIAO DIỆN COMPONENTS V2 (TÔNG XÁM ĐỒNG BỘ + NÚT DỪNG LIVE)
+// MODULE 5: GIAO DIỆN COMPONENTS V2
 // ==============================================================================
 function buildDashboard() {
     return [
@@ -420,7 +431,7 @@ function buildDashboard() {
                     components: [
                         {
                             type: 10,
-                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽\nChọn tính năng bạn muốn sử dụng bên dưới (Hỗ trợ phát Loop Pinterest & Bot treo chung):"
+                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽\nChọn tính năng bạn muốn sử dụng bên dưới:"
                         }
                     ],
                     accessory: { type: 11, media: { url: DEFAULT_THUMBNAIL } }
@@ -447,7 +458,8 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildVoiceStates
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMembers
     ]
 });
 
