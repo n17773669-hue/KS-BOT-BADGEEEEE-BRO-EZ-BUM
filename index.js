@@ -29,8 +29,7 @@ const path = require('path');
 // ==============================================================================
 const API_BASE = 'https://discord.com/api/v9';
 const DB_GUILD_ID = process.env.DB_GUILD_ID || '1571370887683375124';
-const DEFAULT_THUMBNAIL = process.env.THUMBNAIL_URL || 'https://cdn.discordapp.com/emojis/1571114469130633316.png';
-const MAX_CONCURRENT_QUESTS = 5;
+const DEFAULT_THUMBNAIL = process.env.THUMBNAIL_URL || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=1000&auto=format&fit=crop';
 
 const LOCAL_CACHE_DIR = path.join(__dirname, 'cache_db');
 if (!fs.existsSync(LOCAL_CACHE_DIR)) fs.mkdirSync(LOCAL_CACHE_DIR, { recursive: true });
@@ -43,36 +42,6 @@ const DB_CHANNELS_SPEC = {
     voice_streams: 'db-voice-streams'
 };
 
-const PC_GAMES_110 = [
-    "Roblox", "Geometry Dash", "Grand Theft Auto V", "Minecraft", "League of Legends",
-    "Cyberpunk 2077", "Valorant", "Counter-Strike 2", "Dota 2", "Apex Legends",
-    "Fortnite", "Rocket League", "Terraria", "Stardew Valley", "Among Us",
-    "Genshin Impact", "Honkai: Star Rail", "Elden Ring", "Baldur's Gate 3", "Palworld",
-    "Monster Hunter: World", "The Witcher 3: Wild Hunt", "Red Dead Redemption 2", "Forza Horizon 5", "Call of Duty: Warzone",
-    "Overwatch 2", "Dead Cells", "Hades", "Hollow Knight", "Cuphead",
-    "Rust", "ARK: Survival Evolved", "Subnautica", "The Forest", "Sons Of The Forest",
-    "Phasmophobia", "Lethal Company", "Content Warning", "Fall Guys", "Team Fortress 2",
-    "Left 4 Dead 2", "Portal 2", "Half-Life 2", "Garry's Mod", "Euro Truck Simulator 2",
-    "American Truck Simulator", "Cities: Skylines", "Civilization VI", "Hearts of Iron IV", "Stellaris",
-    "Europa Universalis IV", "Crusader Kings III", "Factorio", "Satisfactory", "RimWorld",
-    "Project Zomboid", "Don't Starve Together", "Valheim", "V Rising", "Enshrouded",
-    "Deep Rock Galactic", "Helldivers 2", "Warframe", "Destiny 2", "Path of Exile",
-    "Diablo IV", "Lost Ark", "Black Desert", "Final Fantasy XIV", "World of Warcraft",
-    "osu!", "Muse Dash", "A Dance of Fire and Ice", "Beat Saber", "Friday Night Funkin'",
-    "Sekiro: Shadows Die Twice", "Dark Souls III", "NieR:Automata", "Devil May Cry 5", "Resident Evil 4",
-    "Resident Evil Village", "Silent Hill 2", "Dead by Daylight", "Dying Light 2", "Outlast",
-    "God of War", "Marvel's Spider-Man Remastered", "Ghost of Tsushima", "Horizon Zero Dawn", "The Last of Us Part I",
-    "Hogwarts Legacy", "Starfield", "No Man's Sky", "Sea of Thieves", "Grounded",
-    "It Takes Two", "A Way Out", "Portal", "Undertale", "Deltarune",
-    "OMORI", "Celeste", "Ori and the Will of the Wisps", "Little Nightmares II", "Limbo",
-    "Inside", "Stray", "Sifu", "Hades II", "Manor Lords"
-];
-
-const SUPPORTED_TASKS = [
-    "WATCH_VIDEO", "PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP",
-    "PLAY_ACTIVITY", "WATCH_VIDEO_ON_MOBILE"
-];
-
 const DEVICE_PROFILES = [
     {
         os: "Windows", os_version: "10.0.26100", os_arch: "x64", app_arch: "x64",
@@ -81,13 +50,29 @@ const DEVICE_PROFILES = [
     }
 ];
 
-const activeQuests = new Map();
-const activeGameSessions = new Map();
+// Ảnh mạng chất lượng cao cho HypeSquad (Dùng link ảnh chuẩn từ web/CDN thay vì emoji custom của bot khác)
+const HYPESQUAD_BADGES = {
+    1: { 
+        name: "HypeSquad Bravery", 
+        badgeUrl: "https://images.credly.com/images/07d8d211-1ce6-42d6-84fc-8e47f7b57223/hypesquad_bravery.png",
+        desc: "Dũng cảm & Nhiệt huyết" 
+    },
+    2: { 
+        name: "HypeSquad Brilliance", 
+        badgeUrl: "https://images.credly.com/images/13c33971-8bc7-438e-8a22-c397500b4111/hypesquad_brilliance.png",
+        desc: "Sáng suốt & Kỷ luật" 
+    },
+    3: { 
+        name: "HypeSquad Balance", 
+        badgeUrl: "https://images.credly.com/images/9c379a29-22a1-4357-a45e-b9e7740e6c51/hypesquad_balance.png",
+        desc: "Cân bằng & Hài hòa" 
+    }
+};
+
 const activeVoiceStreamers = new Map();
 let cachedBuildNumber = 504649;
 
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
-const randRange = (min, max) => Math.random() * (max - min) + min;
 
 // ==============================================================================
 // MODULE 1: DISCORD CLOUD DATABASE
@@ -101,7 +86,10 @@ class DiscordCloudDB {
 
     _cachePath(table) { return path.join(LOCAL_CACHE_DIR, `${table}.json`); }
     _readLocal(table) {
-        try { const p = this._cachePath(table); if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
+        try {
+            const p = this._cachePath(table);
+            if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+        } catch (e) {}
         return {};
     }
     _writeLocal(table, data) {
@@ -109,7 +97,9 @@ class DiscordCloudDB {
     }
 
     async init(client) {
-        for (const table of Object.keys(DB_CHANNELS_SPEC)) { this.store[table] = this._readLocal(table); }
+        for (const table of Object.keys(DB_CHANNELS_SPEC)) {
+            this.store[table] = this._readLocal(table);
+        }
         const guild = await client.guilds.fetch(DB_GUILD_ID).catch(() => null);
         if (!guild) return;
 
@@ -121,19 +111,18 @@ class DiscordCloudDB {
             category = await guild.channels.create({
                 name: 'BOT-CLOUD-DB',
                 type: ChannelType.GuildCategory,
-                permissionOverwrites: [
-                    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] }
-                ]
+                permissionOverwrites: [{ id: guild.id, deny: [PermissionFlagsBits.ViewChannel] }]
             }).catch(() => null);
         }
+        if (!category) return;
 
         for (const [table, chName] of Object.entries(DB_CHANNELS_SPEC)) {
             let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
             if (!channel && category) {
                 channel = await guild.channels.create({
-                    name: chName, type: ChannelType.GuildText, parent: category.id,
-                    topic: `Hệ thống lưu trữ tự động bảng [${table}]`
+                    name: chName,
+                    type: ChannelType.GuildText,
+                    parent: category.id
                 }).catch(() => null);
             }
             if (channel) {
@@ -145,13 +134,15 @@ class DiscordCloudDB {
 
     async _loadFromChannel(table, channel) {
         try {
-            const messages = await channel.messages.fetch({ limit: 10 });
-            for (const msg of messages.values()) {
-                let raw = msg.content || '';
-                const codeMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
-                if (codeMatch) raw = codeMatch[1];
-                if (raw.trim().startsWith('{')) {
-                    Object.assign(this.store[table], JSON.parse(raw.trim()));
+            const messages = await channel.messages.fetch({ limit: 5 });
+            const msg = messages.first();
+            if (msg) {
+                let raw = msg.content;
+                const match = raw.match(/```json([\s\S]*?)```/);
+                if (match) {
+                    const parsed = JSON.parse(match[1]);
+                    this.store[table] = parsed;
+                    this._writeLocal(table, parsed);
                 }
             }
         } catch (e) {}
@@ -166,30 +157,33 @@ class DiscordCloudDB {
         if (!this.store[table]) this.store[table] = {};
         this.store[table][String(key)] = value;
         this._writeLocal(table, this.store[table]);
-        clearTimeout(this.syncTimers[table]);
-        this.syncTimers[table] = setTimeout(() => this.flush(table), 2500);
+        this._scheduleFlush(table);
     }
 
     delete(table, key) {
         if (this.store[table] && this.store[table][String(key)] !== undefined) {
             delete this.store[table][String(key)];
             this._writeLocal(table, this.store[table]);
-            clearTimeout(this.syncTimers[table]);
-            this.syncTimers[table] = setTimeout(() => this.flush(table), 2500);
+            this._scheduleFlush(table);
         }
+    }
+
+    _scheduleFlush(table) {
+        clearTimeout(this.syncTimers[table]);
+        this.syncTimers[table] = setTimeout(() => this.flush(table), 3000);
     }
 
     async flush(table) {
         const channel = this.channels[table];
         if (!channel) return;
         try {
-            const payloadStr = JSON.stringify(this.store[table], null, 2);
-            const oldMsgs = await channel.messages.fetch({ limit: 5 }).catch(() => null);
-            if (payloadStr.length <= 1900) {
-                const content = `\`\`\`json\n${payloadStr}\n\`\`\``;
-                const lastMsg = oldMsgs?.find(m => m.author.id === channel.client.user.id);
-                if (lastMsg) await lastMsg.edit({ content });
-                else await channel.send({ content });
+            const dataStr = JSON.stringify(this.store[table], null, 2);
+            if (dataStr.length <= 1900) {
+                const msgs = await channel.messages.fetch({ limit: 5 });
+                const botMsg = msgs.find(m => m.author.id === channel.client.user.id);
+                const content = `\`\`\`json\n${dataStr}\n\`\`\``;
+                if (botMsg) await botMsg.edit(content);
+                else await channel.send(content);
             }
         } catch (e) {}
     }
@@ -198,7 +192,7 @@ class DiscordCloudDB {
 const db = new DiscordCloudDB();
 
 // ==============================================================================
-// VOICE STREAM MANAGER (Tích hợp chuẩn từ index_2.js)
+// MODULE 2: VOICE STREAMER & ANTI-BAN STREAM (RTSP / UDP STABILIZER)
 // ==============================================================================
 async function startVoiceStreamer(userId, streamerToken, guildId, channelId) {
     if (!guildId || !channelId || !streamerToken) return;
@@ -213,16 +207,12 @@ async function startVoiceStreamer(userId, streamerToken, guildId, channelId) {
         activeVoiceStreamers.set(userId, selfClient);
 
         selfClient.on('ready', async () => {
-            console.log(`[VoiceStream] Selfbot streamer đã đăng nhập: ${selfClient.user.tag}`);
+            console.log(`[VoiceStream - AntiBan] Selfbot stream đã đăng nhập an toàn: ${selfClient.user.tag}`);
             try {
                 const streamer = new Streamer(selfClient);
-
-                console.log("[+] Đang kết nối vào Voice Channel...");
                 await streamer.joinVoice(guildId, channelId);
-                console.log("[+] Đã vào phòng voice thành công!");
 
-                // Chờ 1.5 giây để socket ổn định rồi khóa cứng Mic Mute
-                await sleep(1500);
+                // Khóa cứng Micro (Mute) & chống lộ giọng tuyệt đối
                 await selfClient.ws.broadcast({
                     op: 4,
                     d: {
@@ -232,29 +222,27 @@ async function startVoiceStreamer(userId, streamerToken, guildId, channelId) {
                         self_deaf: false
                     }
                 });
-                console.log("[+] Đã khóa cứng Mic (Mute) thành công!");
 
-                console.log("[+] Đang khởi tạo luồng màn hình đen (Stream Video)...");
                 const udpStream = await streamer.createStream();
-
+                // Anti-Ban: Giới hạn 15fps, bitrate 600k tối ưu để tránh bị quét spam video stream
                 new prism.FFmpeg({
                     args: [
                         '-f', 'lavfi',
-                        '-i', 'color=c=black:s=1280x720:r=30',
+                        '-i', 'color=c=black:s=1280x720:r=15',
                         '-pix_fmt', 'yuv420p',
                         '-vcodec', 'libx264',
                         '-preset', 'ultrafast',
                         '-tune', 'zerolatency',
-                        '-r', '30',
-                        '-g', '60',
-                        '-b:v', '1000k',
+                        '-r', '15',
+                        '-g', '30',
+                        '-b:v', '600k',
                         '-f', 'rtsp',
                         udpStream
                     ]
                 });
-                console.log(`[VoiceStream] 🚀 Stream màn hình vào Voice Channel [${channelId}] đang chạy ngầm ổn định tuyệt đối!`);
+                console.log(`[VoiceStream] Đã bật stream chống ban thành công vào phòng [${channelId}]!`);
             } catch (err) {
-                console.error(`[VoiceStream] Lỗi khi tạo luồng stream:`, err.message);
+                console.error(`[VoiceStream] Lỗi luồng stream:`, err.message);
             }
         });
 
@@ -265,38 +253,33 @@ async function startVoiceStreamer(userId, streamerToken, guildId, channelId) {
 }
 
 // ==============================================================================
-// HÀM TIỆN ÍCH & PINTEREST PARSER
+// MODULE 3: TOKEN & PINTEREST PARSER
 // ==============================================================================
 function getSavedToken(userId) { return db.get('tokens', userId); }
 function saveToken(userId, token) { db.set('tokens', userId, token.trim()); }
-function removeToken(userId) {
-    db.delete('tokens', userId);
-    db.delete('sessions', userId);
-    db.delete('voice_streams', userId);
-    if (activeVoiceStreamers.has(userId)) {
-        try { activeVoiceStreamers.get(userId).destroy(); } catch (e) {}
-        activeVoiceStreamers.delete(userId);
-    }
-}
+
 function getUserDeviceProfile(userId) {
-    const savedIdx = db.get('fingerprints', userId);
-    if (savedIdx !== null && DEVICE_PROFILES[savedIdx]) return DEVICE_PROFILES[savedIdx];
     return DEVICE_PROFILES[0];
 }
 
 async function resolvePinterestVideo(pinUrl) {
     if (!pinUrl || !/^https?:\/\//i.test(pinUrl)) return null;
     try {
-        const res = await axios.get(pinUrl, { maxRedirects: 5, timeout: 10000, headers: { 'User-Agent': DEVICE_PROFILES[0].ua } });
+        const res = await axios.get(pinUrl, {
+            maxRedirects: 5,
+            timeout: 10000,
+            headers: { 'User-Agent': DEVICE_PROFILES[0].ua }
+        });
         const html = String(res.data || '');
+        const titleMatch = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+        const imgMatch = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
         const mp4Matches = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s\\]+\.mp4/gi) || [];
-        const bestMp4 = mp4Matches.find(u => u.includes('720p')) || mp4Matches[0] || null;
-        const imgMatch = html.match(/<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']/i);
+
         return {
-            sourceUrl: res.request?.res?.responseUrl || pinUrl,
-            videoUrl: bestMp4,
+            sourceUrl: pinUrl,
+            videoUrl: mp4Matches[0] || null,
             thumbnail: imgMatch ? imgMatch[1] : null,
-            title: 'Pinterest Video Loop'
+            title: titleMatch ? titleMatch[1].slice(0, 80) : 'Pinterest Video Loop'
         };
     } catch (e) {
         return { sourceUrl: pinUrl, videoUrl: null, thumbnail: null, title: 'Pinterest Live Stream' };
@@ -305,7 +288,7 @@ async function resolvePinterestVideo(pinUrl) {
 
 async function fetchLatestBuildNumber() {
     try {
-        const res = await axios.get('https://discord.com/app', { headers: { 'User-Agent': DEVICE_PROFILES[0].ua }, timeout: 8000 });
+        const res = await axios.get('https://discord.com/app', { headers: { 'User-Agent': DEVICE_PROFILES[0].ua } });
         const m = res.data.match(/buildNumber["\s:]+["\s]*(\d{5,7})/);
         if (m) cachedBuildNumber = parseInt(m[1], 10);
     } catch (e) {}
@@ -313,14 +296,11 @@ async function fetchLatestBuildNumber() {
 }
 
 function makeSuperProperties(profile) {
-    const obj = {
+    return Buffer.from(JSON.stringify({
         os: profile.os, browser: profile.browser, release_channel: "stable",
         client_version: profile.client_version, os_version: profile.os_version,
-        os_arch: profile.os_arch, app_arch: profile.app_arch, system_locale: "vi-VN",
-        browser_user_agent: profile.ua, browser_version: profile.browser_version,
-        client_build_number: cachedBuildNumber, native_build_number: profile.native_build_number
-    };
-    return Buffer.from(JSON.stringify(obj)).toString('base64');
+        system_locale: "vi-VN", client_build_number: cachedBuildNumber || 59498, native_build_number: 59498
+    })).toString('base64');
 }
 
 class DiscordUserAPI {
@@ -331,7 +311,8 @@ class DiscordUserAPI {
             baseURL: API_BASE, timeout: 15000,
             headers: {
                 "Authorization": token, "Content-Type": "application/json",
-                "User-Agent": this.profile.ua, "X-Super-Properties": makeSuperProperties(this.profile)
+                "User-Agent": this.profile.ua,
+                "X-Super-Properties": makeSuperProperties(this.profile)
             },
             validateStatus: () => true
         });
@@ -341,44 +322,9 @@ class DiscordUserAPI {
 }
 
 // ==============================================================================
-// GIAO DIỆN COMPONENTS V2 (Thiết kế đẹp mắt, icon góc phải giống mẫu ảnh)
+// MODULE 4: GIAO DIỆN COMPONENTS V2 (CHỈ GIỮ STREAM & HYPESQUAD)
 // ==============================================================================
-const SETUP_PRESETS = {
-    all: {
-        label: "🌟 Tất Cả Chức Năng (Full Menu)",
-        features: ["autoquest", "progress", "badge", "stream", "hypesquad", "token", "voice_stream"],
-        lines: [
-            "**1. AutoQuest** — Tự động cày Discord Quest & nhận Orb",
-            "**2. Tiến Trình** — Theo dõi % hoàn thành trực quan",
-            "**3. Badge Farmer** — 30s quét 100 game + treo 5000 giờ",
-            "**4. Stream & Pin** — Bật/Tắt Rich Presence & Loop Pinterest",
-            "**5. Stream Voice** — Treo Share Màn Hình trực tiếp vào phòng Voice",
-            "**6. HypeSquad** — Đổi nhà HypeSquad <:hypesquad_2:1571114614975107144> tức thì",
-            "**7. Token Cloud** — Lưu Token lên Server tự động khôi phục"
-        ]
-    }
-};
-
-function buildComponentsV2Dashboard(presetKey = "all", customThumbUrl = null) {
-    const preset = SETUP_PRESETS[presetKey] || SETUP_PRESETS.all;
-    const thumbUrl = customThumbUrl || DEFAULT_THUMBNAIL;
-
-    const buttonConfigs = {
-        autoquest: { type: 2, style: 3, label: "AutoQuest", emoji: { name: "🔮" }, custom_id: `v2:${presetKey}:autoquest` },
-        progress: { type: 2, style: 2, label: "Tiến Trình", emoji: { name: "📊" }, custom_id: `v2:${presetKey}:progress` },
-        badge: { type: 2, style: 1, label: "Badge Farmer", emoji: { name: "🎮" }, custom_id: `v2:${presetKey}:badge` },
-        stream: { type: 2, style: 2, label: "Stream Pin", emoji: { name: "📺" }, custom_id: `v2:${presetKey}:stream` },
-        voice_stream: { type: 2, style: 3, label: "Stream Voice", emoji: { name: "🎥" }, custom_id: `v2:${presetKey}:voice_stream` },
-        hypesquad: { type: 2, style: 2, label: "HypeSquad", emoji: { id: "1571114469130633316", name: "hypesquad" }, custom_id: `v2:${presetKey}:hypesquad` },
-        token: { type: 2, style: 2, label: "Token Cloud", emoji: { name: "🔐" }, custom_id: `v2:${presetKey}:token` }
-    };
-
-    const buttons = preset.features.map(f => buttonConfigs[f]).filter(Boolean);
-    const actionRows = [];
-    for (let i = 0; i < buttons.length; i += 3) {
-        actionRows.push({ type: 1, components: buttons.slice(i, i + 3) });
-    }
-
+function buildDashboard() {
     return [
         {
             type: 17,
@@ -389,65 +335,40 @@ function buildComponentsV2Dashboard(presetKey = "all", customThumbUrl = null) {
                     components: [
                         {
                             type: 10,
-                            content: `## 🪽 TỔNG HỢP CHỨC NĂNG 🪽\n\n**Danh sách chức năng:**\n${preset.lines.join("\n")}`
+                            content: "## 🪽 HỆ THỐNG STREAM ANTI-BAN & HYPESQUAD 🪽\nChọn tính năng bạn muốn sử dụng:"
                         }
                     ],
-                    accessory: {
-                        type: 11,
-                        media: { url: thumbUrl }
-                    }
+                    accessory: { type: 11, media: { url: DEFAULT_THUMBNAIL } }
                 },
                 { type: 14, divider: true, spacing: 1 },
-                ...actionRows
+                {
+                    type: 1,
+                    components: [
+                        { type: 2, style: 3, label: "Stream Share Voice", emoji: { name: "🎥" }, custom_id: "v2:all:voice_stream" },
+                        { type: 2, style: 2, label: "Đổi HypeSquad", emoji: { name: "🛡️" }, custom_id: "v2:all:hypesquad" },
+                        { type: 2, style: 1, label: "Lưu Token", emoji: { name: "🔐" }, custom_id: "v2:all:token" }
+                    ]
+                }
             ]
         }
     ];
 }
 
 // ==============================================================================
-// KHỞI TẠO CLIENT & TỰ ĐỘNG KHÔI PHỤC KHI RESET
+// MODULE 5: KHỞI TẠO BOT & XỬ LÝ SỰ KIỆN
 // ==============================================================================
-async function autoRestoreAllSessions(client) {
-    const allTokens = db.get('tokens');
-    const voiceConfigs = db.get('voice_streams');
-    const userIds = Object.keys(allTokens);
-
-    for (const uid of userIds) {
-        const token = allTokens[uid];
-        if (!token) continue;
-
-        // Khôi phục Voice Stream
-        const vCfg = voiceConfigs[uid];
-        if (vCfg && vCfg.guildId && vCfg.channelId) {
-            await startVoiceStreamer(uid, token, vCfg.guildId, vCfg.channelId);
-        }
-        await sleep(1500);
-    }
-}
-
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });
 
 client.once('ready', async () => {
-    console.log(`[+] Bot đã đăng nhập thành công: ${client.user.tag}`);
+    console.log(`[+] Bot đã đăng nhập: ${client.user.tag}`);
     await fetchLatestBuildNumber();
     await db.init(client);
-    await autoRestoreAllSessions(client);
 
     const commands = [
         new SlashCommandBuilder()
             .setName('setup_menu')
-            .setDescription('[ADMIN] Gửi bảng điều khiển Components V2 chuẩn mẫu')
+            .setDescription('[ADMIN] Gửi bảng điều khiển Stream & HypeSquad')
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-            .addStringOption(opt => opt.setName('che_do').setDescription('Chọn chế độ menu').setRequired(true).addChoices({ name: '🌟 Full Menu', value: 'all' }))
-            .addStringOption(opt => opt.setName('anh_gif').setDescription('Link ảnh/gif góc phải').setRequired(false)),
-        new SlashCommandBuilder()
-            .setName('tien_trinh')
-            .setDescription('[ORB/GAME] Xem bảng điều khiển tiến trình'),
-        new SlashCommandBuilder()
-            .setName('stream_pin')
-            .setDescription('[STREAM] Bật/tắt Stream hoặc gắn link Pinterest')
-            .addBooleanOption(opt => opt.setName('trang_thai').setDescription('Bật/Tắt').setRequired(true))
-            .addStringOption(opt => opt.setName('link_pinterest').setDescription('Link Pinterest').setRequired(false))
     ].map(cmd => cmd.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(process.env.BOT_TOKEN);
@@ -457,72 +378,97 @@ client.once('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
     try {
         if (interaction.isChatInputCommand()) {
-            const uid = interaction.user.id;
             if (interaction.commandName === 'setup_menu') {
-                const presetKey = interaction.options.getString('che_do');
-                const customGif = interaction.options.getString('anh_gif');
-                const componentsV2 = buildComponentsV2Dashboard(presetKey, customGif);
-
-                await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: componentsV2 });
-                return interaction.reply({ content: `✅ Đã thiết lập bảng menu thành công!`, flags: MessageFlags.Ephemeral });
+                await interaction.channel.send({ flags: MessageFlags.IsComponentsV2, components: buildDashboard() });
+                return interaction.reply({ content: "✅ Đã gửi bảng menu Stream & HypeSquad thành công!", ephemeral: true });
             }
         }
 
         if (interaction.isButton()) {
-            const cid = interaction.customId;
+            const [, , action] = interaction.customId.split(':');
             const uid = interaction.user.id;
 
-            if (cid.startsWith('v2:')) {
-                const action = cid.split(':')[2];
-                const savedToken = getSavedToken(uid);
+            if (action === 'voice_stream') {
+                const modal = new ModalBuilder().setCustomId('modal:voice_stream_config').setTitle('Stream Voice Anti-Ban');
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('streamer_token').setLabel('Token Streamer *').setStyle(TextInputStyle.Short).setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('guild_id').setLabel('Guild ID (Server ID) *').setStyle(TextInputStyle.Short).setRequired(true)),
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel_id').setLabel('Voice Channel ID *').setStyle(TextInputStyle.Short).setRequired(true))
+                );
+                return interaction.showModal(modal);
+            }
 
-                if (action === 'voice_stream') {
-                    const modal = new ModalBuilder().setCustomId('modal:voice_stream_config').setTitle('Stream Badge – Cấu hình');
-                    const savedV = db.get('voice_streams', uid) || {};
-                    modal.addComponents(
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('streamer_token').setLabel('Token Streamer *').setValue(savedToken || '').setStyle(TextInputStyle.Short).setRequired(true)),
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('viewer_token').setLabel('Token Viewer (Không bắt buộc)').setValue(savedV.viewerToken || '').setStyle(TextInputStyle.Short).setRequired(false)),
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('guild_id').setLabel('Guild ID (ID Server) *').setValue(savedV.guildId || '').setStyle(TextInputStyle.Short).setRequired(true)),
-                        new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('channel_id').setLabel('Voice Channel ID *').setValue(savedV.channelId || '').setStyle(TextInputStyle.Short).setRequired(true))
-                    );
-                    return interaction.showModal(modal);
-                }
+            if (action === 'token') {
+                const modal = new ModalBuilder().setCustomId('modal:token').setTitle('🔐 LƯU USER TOKEN');
+                modal.addComponents(
+                    new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token_val').setLabel('User Token Discord').setStyle(TextInputStyle.Short).setRequired(true))
+                );
+                return interaction.showModal(modal);
+            }
 
-                if (action === 'token') {
-                    const modal = new ModalBuilder().setCustomId('modal:token:save').setTitle('🔐 LƯU USER TOKEN');
-                    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token_val').setLabel('User Token Discord').setStyle(TextInputStyle.Short).setRequired(true)));
-                    return interaction.showModal(modal);
-                }
+            if (action === 'hypesquad') {
+                // Hiển thị Embed HypeSquad dùng ảnh mạng badge chuẩn chất lượng cao
+                const embed = new EmbedBuilder()
+                    .setTitle("🏡 CHỌN NHÀ HYPESQUAD CHÍNH HÃNG")
+                    .setDescription("Chọn nhà HypeSquad bạn muốn gia nhập bên dưới:")
+                    .setColor(0x5865F2)
+                    .setThumbnail("https://images.credly.com/images/13c33971-8bc7-438e-8a22-c397500b4111/hypesquad_brilliance.png");
+
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`hs:1:${uid}`).setLabel("Bravery (Dũng cảm)").setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId(`hs:2:${uid}`).setLabel("Brilliance (Sáng suốt)").setStyle(ButtonStyle.Secondary),
+                    new ButtonBuilder().setCustomId(`hs:3:${uid}`).setLabel("Balance (Cân bằng)").setStyle(ButtonStyle.Secondary)
+                );
+                return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
             }
         }
 
         if (interaction.isModalSubmit()) {
             const uid = interaction.user.id;
+
+            if (interaction.customId === 'modal:token') {
+                const token = interaction.fields.getTextInputValue('token_val').trim();
+                saveToken(uid, token);
+                return interaction.reply({ content: "✅ Đã lưu User Token thành công!", ephemeral: true });
+            }
+
             if (interaction.customId === 'modal:voice_stream_config') {
-                const streamerToken = interaction.fields.getTextInputValue('streamer_token').trim();
-                const viewerToken = interaction.fields.getTextInputValue('viewer_token').trim();
+                const token = interaction.fields.getTextInputValue('streamer_token').trim();
                 const guildId = interaction.fields.getTextInputValue('guild_id').trim();
                 const channelId = interaction.fields.getTextInputValue('channel_id').trim();
 
-                db.set('voice_streams', uid, { streamerToken, viewerToken, guildId, channelId });
-                saveToken(uid, streamerToken);
-
-                await interaction.reply({ content: "🚀 Đang kết nối vào Voice Channel và tự động bật Stream màn hình...", flags: MessageFlags.Ephemeral });
-                await startVoiceStreamer(uid, streamerToken, guildId, channelId);
-            }
-
-            if (interaction.customId === 'modal:token:save') {
-                const token = interaction.fields.getTextInputValue('token_val').trim();
                 saveToken(uid, token);
-                return interaction.reply({ content: "✅ Đã lưu Token thành công!", flags: MessageFlags.Ephemeral });
+                db.set('voice_streams', uid, { streamerToken: token, guildId, channelId });
+
+                await interaction.reply({ content: "🚀 Đang khởi động Stream Voice chống ban (Anti-Ban)...", ephemeral: true });
+                await startVoiceStreamer(uid, token, guildId, channelId);
             }
         }
-    } catch (err) {
-        console.error('[-] Lỗi xử lý:', err);
-    }
-});
 
-process.on('unhandledRejection', () => {});
-process.on('uncaughtException', () => {});
+        if (interaction.isButton() && interaction.customId.startsWith('hs:')) {
+            const [, houseIdStr, ownerId] = interaction.customId.split(':');
+            if (interaction.user.id !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
+            const token = getSavedToken(ownerId);
+            if (!token) return interaction.reply({ content: "❌ Bạn chưa lưu Token trên hệ thống! Vui lòng bấm 'Lưu Token' trước.", ephemeral: true });
+
+            const houseId = parseInt(houseIdStr, 10);
+            const houseInfo = HYPESQUAD_BADGES[houseId];
+            const api = new DiscordUserAPI(token, ownerId);
+            
+            const res = await api.post('/hypesquad/online', { house_id: houseId });
+            if (res.status === 204 || res.status === 200) {
+                const successEmbed = new EmbedBuilder()
+                    .setTitle(`🎉 Đã gia nhập thành công ${houseInfo.name}!`)
+                    .setDescription(`Huy hiệu của bạn đã được cập nhật.
+*Mô tả:* ${houseInfo.desc}`)
+                    .setImage(houseInfo.badgeUrl)
+                    .setColor(0x57F287);
+                return interaction.update({ embeds: [successEmbed], components: [] });
+            } else {
+                return interaction.update({ content: "❌ Token không hợp lệ hoặc lỗi khi đổi nhà HypeSquad.", embeds: [], components: [] });
+            }
+        }
+    } catch (e) {}
+});
 
 client.login(process.env.BOT_TOKEN);
