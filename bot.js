@@ -317,7 +317,7 @@ async function stopVoiceStreamer(botClient, userId) {
     return true;
 }
 
-function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUrl = '') {
+function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUrl = '', onProgress = null) {
     return new Promise(async (resolve) => {
         if (!channelId || !streamerToken) return resolve({ ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" });
         if (!/^\d{15,22}$/.test(channelId)) return resolve({ ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" });
@@ -339,11 +339,11 @@ function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUr
 
         const child = fork(STREAM_SCRIPT, [], {
             env,
-            stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-            execArgv: ['--max-old-space-size=160']
+            stdio: ['ignore', 'inherit', 'inherit', 'ipc']
         });
 
         const sess = { child, guildId: null, channelId, stopping: false };
+        if (onProgress) onProgress('login');
         activeVoiceStreamers.set(userId, sess);
 
         let finished = false;
@@ -361,22 +361,24 @@ function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUr
             resolve({ ok, msg, note });
         };
 
-        overallTimer = setTimeout(() => done(false, '❌ Khởi động stream quá lâu (75s), đã hủy.'), 75000);
+        overallTimer = setTimeout(() => done(false, '❌ Khởi động stream quá lâu (180s), đã hủy.'), 180000);
 
         child.on('message', (m) => {
             if (!m || !m.type) return;
+            if (m.type === 'progress') { if (onProgress) onProgress(m.step); return; }
 
             if (m.type === 'channel') {
                 sess.guildId = m.guildId;
-                // Bot chính vào voice chung (nếu bot có trong server và chưa ở phòng nào)
-                const botGuild = botClient.guilds.cache.get(m.guildId);
+            } else if (m.type === 'ready') {
+                // Bot chính chỉ vào voice SAU KHI stream đã lên (tránh làm nhiễu lúc tạo luồng)
+                const botGuild = botClient.guilds.cache.get(sess.guildId);
                 if (botGuild) {
                     const cur = botGuild.voiceStates.cache.get(botClient.user.id)?.channelId;
                     if (!cur) {
                         try {
                             botGuild.shard.send({
                                 op: 4,
-                                d: { guild_id: m.guildId, channel_id: channelId, self_mute: true, self_deaf: true }
+                                d: { guild_id: sess.guildId, channel_id: channelId, self_mute: true, self_deaf: true }
                             });
                             console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}]`);
                         } catch (err) {
@@ -384,7 +386,6 @@ function startVoiceStreamer(botClient, userId, streamerToken, channelId, mediaUr
                         }
                     }
                 }
-            } else if (m.type === 'ready') {
                 done(true, `Đã vào phòng **${m.channelName || channelId}**`);
             } else if (m.type === 'error') {
                 done(false, m.text);
@@ -667,7 +668,25 @@ client.on('interactionCreate', async (interaction) => {
                 db.set('voice_streams', uid, { channelId, mediaUrl });
 
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-                const res = await startVoiceStreamer(client, uid, token, channelId, mediaUrl);
+
+                // Báo người dùng biết là phải đợi (tránh tưởng bot lỗi rồi bỏ đi)
+                const WAIT_NOTE = "\n\n⏳ Quá trình này mất khoảng **30–60 giây**, vui lòng **đợi và đừng bấm lại** nhé. Xong bot sẽ báo ngay tại đây!";
+                const STEP_TEXT = {
+                    login: "🔑 Đang đăng nhập tài khoản streamer...",
+                    joining: "🔊 Đang vào phòng voice...",
+                    joined: "✅ Đã vào phòng voice. Đang khởi tạo luồng stream...",
+                    creating: "📡 Đang chờ Discord cấp luồng stream (bước này lâu nhất)..."
+                };
+                let lastStep = '';
+                const showStep = (step) => {
+                    if (!STEP_TEXT[step] || step === lastStep) return;
+                    lastStep = step;
+                    interaction.editReply({ content: `**Đang khởi động Stream...**\n${STEP_TEXT[step]}${WAIT_NOTE}` }).catch(() => {});
+                };
+                await interaction.editReply({ content: `**Đang khởi động Stream...**\n${STEP_TEXT.login}${WAIT_NOTE}` }).catch(() => {});
+                lastStep = 'login';
+
+                const res = await startVoiceStreamer(client, uid, token, channelId, mediaUrl, showStep);
 
                 if (res.ok) {
                     const stopRow = new ActionRowBuilder().addComponents(
@@ -676,15 +695,14 @@ client.on('interactionCreate', async (interaction) => {
                             .setLabel('⏹️ Dừng Live Ngay')
                             .setStyle(ButtonStyle.Secondary)
                     );
-                    return interaction.followUp({
+                    return interaction.editReply({
                         content: `🚀 **Đã bật Stream Share Voice!**\n• **Phòng Voice:** <#${channelId}>\n• **Chế độ phát:** ${mediaUrl && !res.note ? '🔁 Loop Link' : '⬛ Màn hình đen'}${res.note ? `\n${res.note}` : ''}`,
-                        components: [stopRow],
-                        flags: MessageFlags.Ephemeral
+                        components: [stopRow]
                     });
                 } else {
-                    return interaction.followUp({
+                    return interaction.editReply({
                         content: `❌ **Không thể khởi động Stream:**\n${res.msg}`,
-                        flags: MessageFlags.Ephemeral
+                        components: []
                     });
                 }
             }
