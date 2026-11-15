@@ -1533,7 +1533,7 @@ client.on('interactionCreate', async (interaction) => {
                             new TextInputBuilder().setCustomId('streamer_token').setLabel('Token Streamer (tài khoản cần stream) *').setValue(savedT).setStyle(TextInputStyle.Short).setRequired(true)
                         ),
                         new ActionRowBuilder().addComponents(
-                            new TextInputBuilder().setCustomId('viewer_token').setLabel('Token Viewer (tài khoản alt xem stream) [Không bắt buộc]').setValue(savedV.viewerToken || '').setStyle(TextInputStyle.Short).setRequired(false)
+                            new TextInputBuilder().setCustomId('viewer_token').setLabel('Token Viewer (Không bắt buộc)').setValue(savedV.viewerToken || '').setStyle(TextInputStyle.Short).setRequired(false)
                         ),
                         new ActionRowBuilder().addComponents(
                             new TextInputBuilder().setCustomId('guild_id').setLabel('Guild ID (ID server Discord) *').setValue(savedV.guildId || '').setStyle(TextInputStyle.Short).setRequired(true)
