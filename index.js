@@ -16,6 +16,9 @@ const {
     EmbedBuilder,
     MessageFlags
 } = require('discord.js');
+const { Client: SelfClient } = require('discord.js-selfbot-v13');
+const { Streamer } = require('@dank074/discord-video-stream');
+const prism = require('prism-media');
 const axios = require('axios');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -37,7 +40,8 @@ const DB_CHANNELS_SPEC = {
     tokens: 'db-tokens',
     fingerprints: 'db-fingerprints',
     sessions: 'db-sessions',
-    setups: 'db-setups'
+    setups: 'db-setups',
+    voice_streams: 'db-voice-streams'
 };
 
 const PC_GAMES_110 = [
@@ -106,6 +110,7 @@ const HYPESQUAD_HOUSES = {
 
 const activeQuests = new Map();
 const activeGameSessions = new Map();
+const activeVoiceStreamers = new Map(); // Quản lý tiến trình stream voice share màn hình
 let cachedBuildNumber = 504649;
 
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
@@ -121,7 +126,8 @@ class DiscordCloudDB {
             tokens: {},
             fingerprints: {},
             sessions: {},
-            setups: {}
+            setups: {},
+            voice_streams: {}
         };
         this.syncTimers = {};
     }
@@ -145,7 +151,6 @@ class DiscordCloudDB {
     }
 
     async init(client) {
-        // Nạp cache local trước phòng trường hợp mạng chập chờn
         for (const table of Object.keys(DB_CHANNELS_SPEC)) {
             this.store[table] = this._readLocal(table);
         }
@@ -159,7 +164,6 @@ class DiscordCloudDB {
         console.log(`[CloudDB] Đã kết nối Server lưu trữ: ${guild.name} (${guild.id})`);
         const allChannels = await guild.channels.fetch();
 
-        // Tìm hoặc tạo Category "BOT-CLOUD-DB"
         let category = allChannels.find(c => c.type === ChannelType.GuildCategory && c.name === 'BOT-CLOUD-DB');
         if (!category) {
             category = await guild.channels.create({
@@ -173,7 +177,6 @@ class DiscordCloudDB {
             console.log(`[CloudDB] Đã tạo danh mục bảo mật: BOT-CLOUD-DB`);
         }
 
-        // Tạo các kênh lưu trữ và tải lại dữ liệu từ tin nhắn cũ
         for (const [table, chName] of Object.entries(DB_CHANNELS_SPEC)) {
             let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
             if (!channel) {
@@ -193,7 +196,6 @@ class DiscordCloudDB {
     async _loadFromChannel(table, channel) {
         try {
             const messages = await channel.messages.fetch({ limit: 50 });
-            // Duyệt từ cũ đến mới để bản ghi mới nhất ghi đè bản cũ
             const sorted = [...messages.values()].reverse();
             const merged = { ...this.store[table] };
 
@@ -202,7 +204,6 @@ class DiscordCloudDB {
                 const codeMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
                 if (codeMatch) raw = codeMatch[1];
 
-                // Hỗ trợ cả file đính kèm .json nếu dữ liệu lớn
                 if (msg.attachments.size > 0) {
                     const att = msg.attachments.first();
                     if (att && att.name.endsWith('.json')) {
@@ -271,7 +272,6 @@ class DiscordCloudDB {
                     await channel.send({ content });
                 }
             } else {
-                // Nếu dữ liệu vượt quá 2000 ký tự, đính kèm thẳng thành file JSON lên kênh Discord
                 const buf = Buffer.from(payloadStr, 'utf8');
                 if (oldMsgs && oldMsgs.size > 0) {
                     await channel.bulkDelete(oldMsgs).catch(() => {});
@@ -290,6 +290,66 @@ class DiscordCloudDB {
 const db = new DiscordCloudDB();
 
 // ==============================================================================
+// VOICE STREAM MANAGER (Treo Voice + Mute Mic + Stream Màn hình thật qua UDP)
+// ==============================================================================
+async function startVoiceStreamer(userId, streamerToken, guildId, channelId) {
+    if (!guildId || !channelId || !streamerToken) return;
+
+    if (activeVoiceStreamers.has(userId)) {
+        try { activeVoiceStreamers.get(userId).destroy(); } catch (e) {}
+        activeVoiceStreamers.delete(userId);
+    }
+
+    try {
+        const selfClient = new SelfClient({ checkUpdate: false });
+        activeVoiceStreamers.set(userId, selfClient);
+
+        selfClient.on('ready', async () => {
+            console.log(`[VoiceStream] Selfbot streamer đã đăng nhập: ${selfClient.user.tag}`);
+            try {
+                const streamer = new Streamer(selfClient);
+                await streamer.joinVoice(guildId, channelId);
+
+                // Khóa cứng Mic (Mute) an toàn tuyệt đối, chống lộ giọng
+                await selfClient.ws.broadcast({
+                    op: 4,
+                    d: {
+                        guild_id: guildId,
+                        channel_id: channelId,
+                        self_mute: true,
+                        self_deaf: false
+                    }
+                });
+
+                const udpStream = await streamer.createStream();
+                new prism.FFmpeg({
+                    args: [
+                        '-f', 'lavfi',
+                        '-i', 'color=c=black:s=1280x720:r=30',
+                        '-pix_fmt', 'yuv420p',
+                        '-vcodec', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-tune', 'zerolatency',
+                        '-r', '30',
+                        '-g', '60',
+                        '-b:v', '1000k',
+                        '-f', 'rtsp',
+                        udpStream
+                    ]
+                });
+                console.log(`[VoiceStream] Đã bật thành công luồng stream màn hình vào Voice Channel [${channelId}]!`);
+            } catch (err) {
+                console.error(`[VoiceStream] Lỗi khi tạo luồng stream:`, err.message);
+            }
+        });
+
+        await selfClient.login(streamerToken);
+    } catch (err) {
+        console.error(`[VoiceStream] Không thể khởi chạy selfclient:`, err.message);
+    }
+}
+
+// ==============================================================================
 // HÀM TIỆN ÍCH TOKEN, FINGERPRINT & PINTEREST PARSER
 // ==============================================================================
 function getSavedToken(userId) {
@@ -303,6 +363,11 @@ function saveToken(userId, token) {
 function removeToken(userId) {
     db.delete('tokens', userId);
     db.delete('sessions', userId);
+    db.delete('voice_streams', userId);
+    if (activeVoiceStreamers.has(userId)) {
+        try { activeVoiceStreamers.get(userId).destroy(); } catch (e) {}
+        activeVoiceStreamers.delete(userId);
+    }
 }
 
 function getUserDeviceProfile(userId) {
@@ -315,7 +380,6 @@ function getUserDeviceProfile(userId) {
     return DEVICE_PROFILES[idx];
 }
 
-// Trích xuất Video MP4 trực tiếp & Tiêu đề từ link Pinterest (hỗ trợ cả pin.it rút gọn)
 async function resolvePinterestVideo(pinUrl) {
     if (!pinUrl || !/^https?:\/\//i.test(pinUrl)) return null;
     try {
@@ -330,17 +394,14 @@ async function resolvePinterestVideo(pinUrl) {
         const html = String(res.data || '');
         const finalUrl = res.request?.res?.responseUrl || pinUrl;
 
-        // Lấy tiêu đề Pin
         const titleMatch = html.match(/<meta\s+(?:property|name)=["']og:title["']\s+content=["']([^"']+)["']/i)
             || html.match(/<title>([^<]+)<\/title>/i);
         let title = titleMatch ? titleMatch[1].replace(/\s*\|\s*Pinterest.*$/i, '').trim() : 'Pinterest Video Stream';
         if (!title) title = 'Pinterest Video Loop';
 
-        // Tìm link stream video MP4 / M3U8 của Pinterest
         const mp4Matches = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s\\]+\.mp4/gi) || [];
         const bestMp4 = mp4Matches.find(u => u.includes('720p')) || mp4Matches[0] || null;
 
-        // Lấy ảnh bìa thumbnail của Pin
         const imgMatch = html.match(/<meta\s+(?:property|name)=["']og:image["']\s+content=["']([^"']+)["']/i);
         const thumbnail = imgMatch ? imgMatch[1] : null;
 
@@ -371,7 +432,6 @@ async function fetchLatestBuildNumber() {
                 const m = jsRes.data.match(/buildNumber["\s:]+["\s]*(\d{5,7})/);
                 if (m) {
                     cachedBuildNumber = parseInt(m[1], 10);
-                    console.log(`[Anti-Ban] Đã đồng bộ Discord Build Number mới nhất: ${cachedBuildNumber}`);
                     return cachedBuildNumber;
                 }
             } catch (e) {}
@@ -503,7 +563,6 @@ class BadgeFarmSession {
         this.targetHours = Math.max(1, Math.min(options.targetHours || 5000, 5000));
         this.startTime = options.startTime || Date.now();
 
-        // Cấu hình Stream & Pinterest Video Loop
         this.streamEnabled = Boolean(options.streamEnabled);
         this.pinUrl = options.pinUrl || '';
         this.pinData = options.pinData || null;
@@ -560,18 +619,16 @@ class BadgeFarmSession {
         const activities = [];
         const now = Date.now();
 
-        // 1. Nếu bật chế độ Stream (Nút tím Streaming + Loop Video Pinterest)
         if (this.streamEnabled) {
             const streamTitle = this.pinData?.title || "Pinterest Video Loop 24/7";
             const streamLink = this.pinData?.sourceUrl || this.pinUrl || "https://www.twitch.tv/discord";
-            // Discord chỉ hiển thị nút tím nếu url hợp lệ (twitch/youtube), nếu dùng link pinterest sẽ để state/details kèm link pin
             const validTwitchUrl = /^https?:\/\/(www\.)?(twitch\.tv|youtube\.com)\//i.test(streamLink)
                 ? streamLink
                 : "https://www.twitch.tv/pinterest_live";
 
             activities.push({
                 name: streamTitle,
-                type: 1, // 1 = STREAMING (Trạng thái tím)
+                type: 1,
                 url: validTwitchUrl,
                 details: this.pinUrl ? `🔁 Loop Pin #${this.loopCount + 1}` : "🔴 Đang phát trực tiếp 24/7",
                 state: this.pinData?.videoUrl ? `MP4: ${this.pinData.videoUrl.slice(0, 60)}...` : (this.pinUrl || "Đang treo Stream"),
@@ -579,12 +636,11 @@ class BadgeFarmSession {
             });
         }
 
-        // 2. Nhồi đồng thời nhiều game (Multi-Game Presence) để cày giờ song song
         if (gamesList && gamesList.length > 0) {
             for (const g of gamesList) {
                 activities.push({
                     name: g,
-                    type: 0, // 0 = PLAYING
+                    type: 0,
                     timestamps: { start: this.startTime }
                 });
             }
@@ -603,7 +659,6 @@ class BadgeFarmSession {
     }
 
     async _runRapid30sBurst() {
-        // Trong 30 giây đầu: Bắn lần lượt 100 game (mỗi nhịp 5 game x 20 nhịp = 100 game trong ~30s)
         this.phase = "⚡ Giai đoạn 1: Đang spam quét đủ 100 game (30s)...";
         const pool = [...PC_GAMES_110.slice(0, this.maxGames)];
         const batchSize = 5;
@@ -622,7 +677,6 @@ class BadgeFarmSession {
     }
 
     _startContinuousMultiGameLoop() {
-        // Giai đoạn 2: Treo đồng thời 8 game cùng lúc & xoay vòng liên tục suốt 5000 giờ
         this.phase = "🔥 Giai đoạn 2: Treo Multi-Game liên tục (5000h)";
         const pickBatch = () => {
             const shuffled = [...PC_GAMES_110.slice(0, this.maxGames)].sort(() => Math.random() - 0.5);
@@ -648,9 +702,8 @@ class BadgeFarmSession {
                 this.sendMultiPresence(pickBatch());
                 this.saveState();
             }
-        }, 60 * 1000); // Xoay cụm 8 game mỗi 60 giây liên tục
+        }, 60 * 1000);
 
-        // Bộ đếm Loop Video Pinterest (mỗi 45 giây lặp lại 1 vòng video)
         clearInterval(this._loopTimer);
         this._loopTimer = setInterval(() => {
             if (this.isRunning && this.streamEnabled && !this.isPaused) {
@@ -702,7 +755,6 @@ class BadgeFarmSession {
                 ws.close();
             } else if (data.t === "READY") {
                 this._mySid = data.d?.session_id;
-                // Chạy burst 30s spam 100 game trước, sau đó chuyển sang treo đa game 5000h
                 await this._runRapid30sBurst();
                 if (this.isRunning) {
                     this._startContinuousMultiGameLoop();
@@ -800,11 +852,11 @@ function buildOrbQuestComponentsV2(userId) {
 
     return [
         {
-            type: 17, // Container V2
-            accent_color: 0x9B59B6, // Tím Orb sang trọng
+            type: 17,
+            accent_color: 0x9B59B6,
             components: [
                 {
-                    type: 9, // Section + Thumbnail
+                    type: 9,
                     components: [
                         {
                             type: 10,
@@ -1031,35 +1083,15 @@ async function startOrShowAutoQuest(interaction, userToken) {
 const SETUP_PRESETS = {
     all: {
         label: "🌟 Tất Cả Chức Năng (Full Menu)",
-        features: ["autoquest", "progress", "badge", "stream", "hypesquad", "token"],
+        features: ["autoquest", "progress", "badge", "stream", "hypesquad", "token", "voice_stream"],
         lines: [
             "**1. AutoQuest (Orb)** — Tự nhận & cày Quest trực quan",
             "**2. Tiến Trình Orb** — Theo dõi phần trăm & Orb real-time",
             "**3. Badge 5000h** — 30s quét 100 game + treo đa game liên tục",
             "**4. Stream & Pin** — Bật/Tắt Stream & treo Loop Video Pinterest",
-            "**5. HypeSquad** — Đổi nhà <:hypesquad_2:1571114614975107144> <:hypesquad_1:1571114521601245224> <:hypesquad:1571114469130633316> tức thì",
-            "**6. Token Cloud** — Lưu Token lên Server tự động khôi phục"
-        ]
-    },
-    quest_only: {
-        label: "🔮 Chuyên Cày Orb & Quest",
-        features: ["autoquest", "progress", "cancel_quest", "token"],
-        lines: [
-            "**1. AutoQuest (Orb)** — Tự động nhận & cày Discord Quest",
-            "**2. Tiến Trình Orb** — Xem tiến độ & số Orb thu hoạch",
-            "**3. Hủy Quest** — Dừng tiến trình đang cày tức thì",
-            "**4. Token Cloud** — Lưu User Token bảo mật lên Cloud"
-        ]
-    },
-    quest_badge: {
-        label: "🎮 Quest, Badge 5000h & Stream Pin",
-        features: ["autoquest", "progress", "badge", "stream", "token"],
-        lines: [
-            "**1. AutoQuest (Orb)** — Cày Quest nhận Orb tự động",
-            "**2. Tiến Trình Orb** — Theo dõi tiến độ real-time",
-            "**3. Badge 5000h** — 30s spam 100 game & treo đa game 5000h",
-            "**4. Stream & Pin** — Bật/Tắt Stream tím & Loop Video Pinterest",
-            "**5. Token Cloud** — Tự động đăng nhập lại khi reset bot"
+            "**5. Stream Voice (Modal)** — Treo Share Màn Hình vào phòng Voice cày huy hiệu",
+            "**6. HypeSquad** — Đổi nhà <:hypesquad_2:1571114614975107144> <:hypesquad_1:1571114521601245224> <:hypesquad:1571114469130633316> tức thì",
+            "**7. Token Cloud** — Lưu Token lên Server tự động khôi phục"
         ]
     }
 };
@@ -1071,9 +1103,9 @@ function buildComponentsV2Dashboard(presetKey = "all", customThumbUrl = null) {
     const buttonConfigs = {
         autoquest: { type: 2, style: 3, label: "Cày Orb / Quest", emoji: { name: "🔮" }, custom_id: `v2:${presetKey}:autoquest` },
         progress: { type: 2, style: 2, label: "Tiến Trình", emoji: { name: "📊" }, custom_id: `v2:${presetKey}:progress` },
-        cancel_quest: { type: 2, style: 4, label: "Hủy Quest", emoji: { name: "🛑" }, custom_id: `v2:${presetKey}:cancel_quest` },
         badge: { type: 2, style: 1, label: "Treo 100 Game / 5000h", emoji: { name: "🎮" }, custom_id: `v2:${presetKey}:badge` },
         stream: { type: 2, style: 2, label: "Stream & Pin Loop", emoji: { name: "📺" }, custom_id: `v2:${presetKey}:stream` },
+        voice_stream: { type: 2, style: 3, label: "Stream Share Voice", emoji: { name: "🎥" }, custom_id: `v2:${presetKey}:voice_stream` },
         hypesquad: {
             type: 2, style: 2, label: "HypeSquad",
             emoji: { id: "1571114469130633316", name: "hypesquad" },
@@ -1093,7 +1125,7 @@ function buildComponentsV2Dashboard(presetKey = "all", customThumbUrl = null) {
 
     return [
         {
-            type: 17, // Container
+            type: 17,
             accent_color: 0xFFFFFF,
             components: [
                 {
@@ -1101,7 +1133,7 @@ function buildComponentsV2Dashboard(presetKey = "all", customThumbUrl = null) {
                     components: [
                         {
                             type: 10,
-                            content: `## 🪽 HỆ THỐNG TREO GAME & CÀY ORB 24/7 🪽\n**Danh sách chức năng:**\n${preset.lines.join("\n")}`
+                            content: `## 🪽 HỆ THỐNG TREO GAME, CÀY ORB & STREAM VOICE 🪽\n**Danh sách chức năng:**\n${preset.lines.join("\n")}`
                         }
                     ],
                     accessory: {
@@ -1205,11 +1237,12 @@ function buildBadgeAndStreamControlV2(userId) {
 }
 
 // ==============================================================================
-// MODULE 6: TỰ ĐỘNG KHÔI PHỤC TẤT CẢ PHIÊN TREO KHI RESET BOT
+// MODULE 6: TỰ ĐỘNG KHÔI PHỤC TẤT CẢ PHIÊN TREO & VOICE STREAM KHI RESET BOT
 // ==============================================================================
 async function autoRestoreAllSessions(client) {
     const allTokens = db.get('tokens');
     const savedSessions = db.get('sessions');
+    const voiceConfigs = db.get('voice_streams');
     const userIds = Object.keys(allTokens);
 
     if (userIds.length === 0) {
@@ -1227,7 +1260,6 @@ async function autoRestoreAllSessions(client) {
         const api = new DiscordUserAPI(token, uid);
         const me = await api.get('/users/@me');
         if (me.status !== 200) {
-            console.log(`[-] Token của user ${uid} đã hết hạn, tự động dọn dẹp khỏi CloudDB.`);
             removeToken(uid);
             continue;
         }
@@ -1235,7 +1267,6 @@ async function autoRestoreAllSessions(client) {
         const uname = me.data.global_name || me.data.username;
         const prevSession = savedSessions[uid];
 
-        // Khôi phục phiên treo game/stream cũ, hoặc mặc định bật treo 100 game / 5000h cho token đã lưu
         const session = new BadgeFarmSession(uid, token, {
             maxGames: prevSession?.maxGames || 100,
             targetHours: prevSession?.targetHours || 5000,
@@ -1249,10 +1280,15 @@ async function autoRestoreAllSessions(client) {
 
         activeGameSessions.set(uid, session);
         session.start();
-        restoredCount++;
-        console.log(`[Auto-Restore] ✅ Đã nối lại treo 100 Game/5000h${session.streamEnabled ? ' + Stream Pin' : ''} cho: ${uname} (${uid})`);
 
-        // Giãn cách 2 giây giữa các tài khoản để không bị dính rate limit Gateway
+        // Khôi phục Voice Stream nếu có cấu hình trước đó
+        const vCfg = voiceConfigs[uid];
+        if (vCfg && vCfg.guildId && vCfg.channelId) {
+            await startVoiceStreamer(uid, token, vCfg.guildId, vCfg.channelId);
+        }
+
+        restoredCount++;
+        console.log(`[Auto-Restore] ✅ Đã khôi phục thành công cho: ${uname} (${uid})`);
         await sleep(2000);
     }
 
@@ -1269,14 +1305,9 @@ const client = new Client({
 client.once('ready', async () => {
     console.log(`[+] Bot đã đăng nhập thành công: ${client.user.tag}`);
     await fetchLatestBuildNumber();
-
-    // 1. Khởi tạo & lấy lại toàn bộ dữ liệu từ Server 1571370887683375124
     await db.init(client);
-
-    // 2. Tự động đăng nhập lại các token cũ để treo tiếp
     await autoRestoreAllSessions(client);
 
-    // 3. Đăng ký Slash Commands
     const commands = [
         new SlashCommandBuilder()
             .setName('setup_menu')
@@ -1287,9 +1318,7 @@ client.once('ready', async () => {
                     .setDescription('Chọn loại menu chức năng phù hợp cho server này')
                     .setRequired(true)
                     .addChoices(
-                        { name: '🌟 Tất Cả Chức Năng (Full Menu)', value: 'all' },
-                        { name: '🔮 Chuyên Cày Orb & Quest', value: 'quest_only' },
-                        { name: '🎮 Quest, Badge 5000h & Stream Pin', value: 'quest_badge' }
+                        { name: '🌟 Tất Cả Chức Năng (Full Menu)', value: 'all' }
                     )
             )
             .addStringOption(opt =>
@@ -1326,7 +1355,6 @@ client.once('ready', async () => {
 
 client.on('interactionCreate', async (interaction) => {
     try {
-        // 1. SLASH COMMANDS
         if (interaction.isChatInputCommand()) {
             const uid = interaction.user.id;
 
@@ -1350,7 +1378,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
 
                 return interaction.reply({
-                    content: `✅ Đã thiết lập bảng **${SETUP_PRESETS[presetKey].label}** & sao lưu lên Cloud DB!`,
+                    content: `✅ Đã thiết lập bảng menu thành công & sao lưu lên Cloud DB!`,
                     ephemeral: true
                 });
             }
@@ -1379,7 +1407,7 @@ client.on('interactionCreate', async (interaction) => {
                 const savedToken = getSavedToken(uid);
 
                 if (!savedToken) {
-                    return interaction.reply({ content: "❌ Bạn chưa lưu Token! Vui lòng bấm nút **Lưu Token** trên menu trước.", ephemeral: true });
+                    return interaction.reply({ content: "❌ Bạn chưa lưu Token! Vui lòng lưu Token trước.", ephemeral: true });
                 }
 
                 await interaction.deferReply({ ephemeral: true });
@@ -1411,7 +1439,6 @@ client.on('interactionCreate', async (interaction) => {
             }
         }
 
-        // 2. BUTTONS
         if (interaction.isButton()) {
             const cid = interaction.customId;
             const uid = interaction.user.id;
@@ -1442,10 +1469,7 @@ client.on('interactionCreate', async (interaction) => {
 
                 if (action === 'progress') {
                     if (!activeQuests.has(uid)) {
-                        return interaction.reply({
-                            content: "ℹ️ Bạn hiện **không có tiến trình cày Orb/Quest nào** đang chạy. Bấm **Cày Orb / Quest** để bắt đầu!",
-                            ephemeral: true
-                        });
+                        return interaction.reply({ content: "ℹ️ Không có tiến trình cày Orb/Quest nào đang chạy.", ephemeral: true });
                     }
                     return interaction.reply({
                         flags: MessageFlags.IsComponentsV2,
@@ -1454,325 +1478,171 @@ client.on('interactionCreate', async (interaction) => {
                     });
                 }
 
-                if (action === 'cancel_quest') {
-                    if (activeQuests.delete(uid)) {
-                        return interaction.reply({ content: "🛑 **Đã dừng tiến trình cày Orb/Quest!**", ephemeral: true });
-                    }
-                    return interaction.reply({ content: "ℹ️ Hiện không có tiến trình cày Orb/Quest nào đang chạy.", ephemeral: true });
-                }
-
                 if (action === 'badge') {
-                    if (activeGameSessions.has(uid) && activeGameSessions.get(uid).isRunning) {
-                        return interaction.reply({
-                            flags: MessageFlags.IsComponentsV2,
-                            components: buildBadgeAndStreamControlV2(uid),
-                            ephemeral: true
-                        });
-                    }
-
                     const modal = new ModalBuilder()
                         .setCustomId('modal:badge')
                         .setTitle('🎮 Treo 100 Game (30s) & 5000 Giờ');
                     modal.addComponents(
                         new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('token_val')
-                                .setLabel('Discord User Token (Bỏ trống nếu đã lưu)')
-                                .setPlaceholder('Dán token vào đây...')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(false)
+                            new TextInputBuilder().setCustomId('token_val').setLabel('Discord User Token (Bỏ trống nếu đã lưu)').setValue('').setStyle(TextInputStyle.Short).setRequired(false)
                         ),
                         new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('games_val')
-                                .setLabel('Số game muốn cày (Mặc định 100)')
-                                .setValue('100')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(true)
+                            new TextInputBuilder().setCustomId('games_val').setLabel('Số game muốn cày').setValue('100').setStyle(TextInputStyle.Short).setRequired(true)
                         ),
                         new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('hours_val')
-                                .setLabel('Số giờ muốn treo liên tục (Tối đa 5000)')
-                                .setValue('5000')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(true)
+                            new TextInputBuilder().setCustomId('hours_val').setLabel('Số giờ muốn treo').setValue('5000').setStyle(TextInputStyle.Short).setRequired(true)
                         ),
                         new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('pin_val')
-                                .setLabel('Link Video Pinterest Stream Loop (Tùy chọn)')
-                                .setPlaceholder('https://www.pinterest.com/pin/...')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(false)
+                            new TextInputBuilder().setCustomId('pin_val').setLabel('Link Video Pinterest Loop (Tùy chọn)').setValue('').setStyle(TextInputStyle.Short).setRequired(false)
                         )
                     );
                     return interaction.showModal(modal);
                 }
 
-                if (action === 'stream') {
-                    if (!savedToken) {
-                        return interaction.reply({ content: "❌ Bạn chưa lưu Token! Vui lòng bấm **Lưu Token** trước.", ephemeral: true });
-                    }
-                    let ses = activeGameSessions.get(uid);
-                    if (!ses || !ses.isRunning) {
-                        ses = new BadgeFarmSession(uid, savedToken, { maxGames: 100, targetHours: 5000, streamEnabled: true });
-                        activeGameSessions.set(uid, ses);
-                        ses.start();
-                    }
-                    return interaction.reply({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildBadgeAndStreamControlV2(uid),
-                        ephemeral: true
-                    });
+                // Modal cấu hình Stream Voice Share Màn Hình (Giống ảnh mẫu yêu cầu)
+                if (action === 'voice_stream') {
+                    const modal = new ModalBuilder()
+                        .setCustomId('modal:voice_stream_config')
+                        .setTitle('Stream Badge – Cấu hình');
+
+                    const savedV = db.get('voice_streams', uid) || {};
+                    const savedT = getSavedToken(uid) || '';
+
+                    modal.addComponents(
+                        new ActionRowBuilder().addComponents(
+                            new TextInputBuilder().setCustomId('streamer_token').setLabel('Token Streamer (tài khoản cần stream) *').setValue(savedT).setStyle(TextInputStyle.Short).setRequired(true)
+                        ),
+                        new ActionRowBuilder().addComponents(
+                            new TextInputBuilder().setCustomId('viewer_token').setLabel('Token Viewer (tài khoản alt xem stream) [Không bắt buộc]').setValue(savedV.viewerToken || '').setStyle(TextInputStyle.Short).setRequired(false)
+                        ),
+                        new ActionRowBuilder().addComponents(
+                            new TextInputBuilder().setCustomId('guild_id').setLabel('Guild ID (ID server Discord) *').setValue(savedV.guildId || '').setStyle(TextInputStyle.Short).setRequired(true)
+                        ),
+                        new ActionRowBuilder().addComponents(
+                            new TextInputBuilder().setCustomId('channel_id').setLabel('Voice Channel ID (ID kênh voice) *').setValue(savedV.channelId || '').setStyle(TextInputStyle.Short).setRequired(true)
+                        )
+                    );
+                    return interaction.showModal(modal);
                 }
 
                 if (action === 'hypesquad') {
                     if (!savedToken) {
-                        const modal = new ModalBuilder()
-                            .setCustomId('modal:token:save')
-                            .setTitle('🔐 CẬP NHẬT USER TOKEN');
-                        modal.addComponents(
-                            new ActionRowBuilder().addComponents(
-                                new TextInputBuilder()
-                                    .setCustomId('token_val')
-                                    .setLabel('User Token Discord')
-                                    .setPlaceholder('Dán token vào đây...')
-                                    .setStyle(TextInputStyle.Short)
-                                    .setRequired(true)
-                            )
-                        );
+                        const modal = new ModalBuilder().setCustomId('modal:token:save').setTitle('🔐 CẬP NHẬT USER TOKEN');
+                        modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token_val').setLabel('User Token Discord').setStyle(TextInputStyle.Short).setRequired(true)));
                         return interaction.showModal(modal);
                     }
 
                     const embed = new EmbedBuilder()
                         .setTitle("🏡 CHỌN NHÀ HYPESQUAD")
-                        .setDescription(
-                            "Chọn nhà HypeSquad bạn muốn nhận huy hiệu bên dưới:\n" +
-                            "• <:hypesquad_2:1571114614975107144> **Bravery** — Dũng cảm & Nhiệt huyết\n" +
-                            "• <:hypesquad_1:1571114521601245224> **Brilliance** — Sáng suốt & Kỷ luật\n" +
-                            "• <:hypesquad:1571114469130633316> **Balance** — Cân bằng & Hài hòa"
-                        )
+                        .setDescription("Chọn nhà HypeSquad bạn muốn nhận huy hiệu:")
                         .setColor(0x2B2D31);
 
                     const row = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder().setCustomId(`hs:1:${uid}`).setLabel("Bravery").setEmoji("1571114614975107144").setStyle(ButtonStyle.Secondary),
-                        new ButtonBuilder().setCustomId(`hs:2:${uid}`).setLabel("Brilliance").setEmoji("1571114521601245224").setStyle(ButtonStyle.Secondary),
-                        new ButtonBuilder().setCustomId(`hs:3:${uid}`).setLabel("Balance").setEmoji("1571114469130633316").setStyle(ButtonStyle.Secondary)
+                        new ButtonBuilder().setCustomId(`hs:1:${uid}`).setLabel("Bravery").setStyle(ButtonStyle.Secondary),
+                        new ButtonBuilder().setCustomId(`hs:2:${uid}`).setLabel("Brilliance").setStyle(ButtonStyle.Secondary),
+                        new ButtonBuilder().setCustomId(`hs:3:${uid}`).setLabel("Balance").setStyle(ButtonStyle.Secondary)
                     );
                     return interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
                 }
 
                 if (action === 'token') {
-                    const modal = new ModalBuilder()
-                        .setCustomId('modal:token:save')
-                        .setTitle('🔐 LƯU USER TOKEN LÊN CLOUD');
-                    modal.addComponents(
-                        new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('token_val')
-                                .setLabel('User Token Discord')
-                                .setPlaceholder('Dán token vào đây...')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(true)
-                        )
-                    );
+                    const modal = new ModalBuilder().setCustomId('modal:token:save').setTitle('🔐 LƯU USER TOKEN LÊN CLOUD');
+                    modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('token_val').setLabel('User Token Discord').setStyle(TextInputStyle.Short).setRequired(true)));
                     return interaction.showModal(modal);
                 }
             }
 
-            // Nút điều khiển Orb/Quest (qctrl:refresh:<uid> | qctrl:cancel:<uid>)
             if (cid.startsWith('qctrl:')) {
                 const [, subAction, ownerId] = cid.split(':');
-                if (uid !== ownerId) {
-                    return interaction.reply({ content: "❌ Bảng điều khiển này không phải của bạn.", ephemeral: true });
-                }
-                if (subAction === 'refresh') {
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildOrbQuestComponentsV2(uid)
-                    });
-                }
+                if (uid !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
+                if (subAction === 'refresh') return interaction.update({ flags: MessageFlags.IsComponentsV2, components: buildOrbQuestComponentsV2(uid) });
                 if (subAction === 'cancel') {
                     activeQuests.delete(uid);
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildOrbQuestComponentsV2(uid)
-                    });
+                    return interaction.update({ flags: MessageFlags.IsComponentsV2, components: buildOrbQuestComponentsV2(uid) });
                 }
             }
 
-            // Nút chọn HypeSquad
             if (cid.startsWith('hs:')) {
                 const [, houseIdStr, ownerId] = cid.split(':');
-                if (uid !== ownerId) {
-                    return interaction.reply({ content: "❌ Bảng chọn này không phải của bạn.", ephemeral: true });
-                }
+                if (uid !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
                 const savedToken = getSavedToken(uid);
-                if (!savedToken) {
-                    return interaction.update({ content: "❌ Không tìm thấy Token đã lưu!", embeds: [], components: [] });
-                }
                 const houseId = parseInt(houseIdStr, 10);
-                const house = HYPESQUAD_HOUSES[houseId];
                 const api = new DiscordUserAPI(savedToken, uid);
-                const res = await api.post('/hypesquad/online', { house_id: houseId });
-
-                if ([200, 204].includes(res.status)) {
-                    const embed = new EmbedBuilder()
-                        .setTitle("🎉 ĐỔI NHÀ HYPESQUAD THÀNH CÔNG")
-                        .setDescription(`Tài khoản của bạn đã chuyển sang nhà ${house.emoji} **${house.name}**!`)
-                        .setColor(0x2B2D31);
-                    return interaction.update({ embeds: [embed], components: [] });
-                }
-                return interaction.update({ content: "❌ Lỗi khi đổi HypeSquad (Token hết hạn hoặc bị giới hạn)!", embeds: [], components: [] });
+                await api.post('/hypesquad/online', { house_id: houseId });
+                return interaction.update({ content: "🎉 Đổi nhà HypeSquad thành công!", embeds: [], components: [] });
             }
 
-            // Nút điều khiển Treo 5000h & Stream Pinterest
             if (cid.startsWith('badgeprog:')) {
                 const [, subAction, ownerId] = cid.split(':');
-                if (uid !== ownerId) {
-                    return interaction.reply({ content: "❌ Bảng này không phải của bạn.", ephemeral: true });
-                }
+                if (uid !== ownerId) return interaction.reply({ content: "❌ Không phải bảng của bạn.", ephemeral: true });
                 const ses = activeGameSessions.get(uid);
-                if (!ses || !ses.isRunning) {
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildBadgeAndStreamControlV2(uid)
-                    });
-                }
-
-                if (subAction === 'togglestream') {
-                    ses.toggleStream(!ses.streamEnabled);
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildBadgeAndStreamControlV2(uid)
-                    });
-                }
-
-                if (subAction === 'setpin') {
-                    const modal = new ModalBuilder()
-                        .setCustomId('modal:setpin')
-                        .setTitle('📌 Gắn Link Video Pinterest Loop');
-                    modal.addComponents(
-                        new ActionRowBuilder().addComponents(
-                            new TextInputBuilder()
-                                .setCustomId('pin_url')
-                                .setLabel('Link Pinterest (pinterest.com/pin/... hoặc pin.it)')
-                                .setPlaceholder('https://www.pinterest.com/pin/123456789/')
-                                .setValue(ses.pinUrl || '')
-                                .setStyle(TextInputStyle.Short)
-                                .setRequired(true)
-                        )
-                    );
-                    return interaction.showModal(modal);
-                }
-
-                if (subAction === 'view') {
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildBadgeAndStreamControlV2(uid)
-                    });
-                }
-
-                if (subAction === 'stop') {
+                if (subAction === 'togglestream' && ses) ses.toggleStream(!ses.streamEnabled);
+                if (subAction === 'stop' && ses) {
                     ses.stop();
                     activeGameSessions.delete(uid);
-                    return interaction.update({
-                        flags: MessageFlags.IsComponentsV2,
-                        components: buildBadgeAndStreamControlV2(uid)
-                    });
+                    return interaction.update({ content: "🛑 Đã dừng treo game!", embeds: [], components: [] });
                 }
+                return interaction.update({ flags: MessageFlags.IsComponentsV2, components: buildBadgeAndStreamControlV2(uid) });
             }
         }
 
-        // 3. MODALS
         if (interaction.isModalSubmit()) {
             const uid = interaction.user.id;
 
-            if (interaction.customId.startsWith('modal:token:')) {
-                const mode = interaction.customId.split(':')[2];
-                const token = interaction.fields.getTextInputValue('token_val').trim();
-                await interaction.deferReply({ ephemeral: true });
+            if (interaction.customId === 'modal:voice_stream_config') {
+                const streamerToken = interaction.fields.getTextInputValue('streamer_token').trim();
+                const viewerToken = interaction.fields.getTextInputValue('viewer_token').trim();
+                const guildId = interaction.fields.getTextInputValue('guild_id').trim();
+                const channelId = interaction.fields.getTextInputValue('channel_id').trim();
 
-                const api = new DiscordUserAPI(token, uid);
-                const res = await api.get('/users/@me');
-                if (res.status === 200) {
-                    saveToken(uid, token);
-                    if (mode === 'autoquest') {
-                        return startOrShowAutoQuest(interaction, token);
-                    }
-                    return interaction.followUp({ content: "✅ **Đã lưu Token lên Server Cloud DB!** Bot sẽ tự động đăng nhập lại mỗi khi khởi động.", ephemeral: true });
+                // Lưu vào Cloud DB server 1571370887683375124
+                db.set('voice_streams', uid, { streamerToken, viewerToken, guildId, channelId });
+                saveToken(uid, streamerToken);
+
+                await interaction.reply({ content: "🚀 Đang khởi động kết nối Stream Voice màn hình vào phòng Voice và Treo Game cày huy hiệu...", ephemeral: true });
+
+                // Kích hoạt Voice Streamer
+                await startVoiceStreamer(uid, streamerToken, guildId, channelId);
+
+                // Kích hoạt luôn Badge Farmer 5000h
+                if (!activeGameSessions.has(uid)) {
+                    const gameSes = new BadgeFarmSession(uid, streamerToken, { maxGames: 100, targetHours: 5000 });
+                    activeGameSessions.set(uid, gameSes);
+                    gameSes.start();
                 }
-                return interaction.followUp({ content: "❌ **Token không hợp lệ hoặc đã hết hạn!**", ephemeral: true });
+            }
+
+            if (interaction.customId.startsWith('modal:token:')) {
+                const token = interaction.fields.getTextInputValue('token_val').trim();
+                saveToken(uid, token);
+                return interaction.reply({ content: "✅ Đã lưu Token lên Cloud DB thành công!", ephemeral: true });
             }
 
             if (interaction.customId === 'modal:badge') {
                 const rawTok = interaction.fields.getTextInputValue('token_val').trim();
                 const token = rawTok || getSavedToken(uid);
-                if (!token) {
-                    return interaction.reply({ content: "❌ **Bạn chưa nhập Token hoặc chưa lưu Token trước đó!**", ephemeral: true });
-                }
+                if (!token) return interaction.reply({ content: "❌ Chưa có Token!", ephemeral: true });
 
-                const maxG = Math.max(1, Math.min(parseInt(interaction.fields.getTextInputValue('games_val'), 10) || 100, 100));
-                const maxH = Math.max(1, Math.min(parseInt(interaction.fields.getTextInputValue('hours_val'), 10) || 5000, 5000));
+                const maxG = parseInt(interaction.fields.getTextInputValue('games_val'), 10) || 100;
+                const maxH = parseInt(interaction.fields.getTextInputValue('hours_val'), 10) || 5000;
                 const pinUrl = interaction.fields.getTextInputValue('pin_val').trim();
 
-                await interaction.deferReply({ ephemeral: true });
-                const api = new DiscordUserAPI(token, uid);
-                const res = await api.get('/users/@me');
-                if (res.status !== 200) {
-                    return interaction.followUp({ content: "❌ **Token không hợp lệ hoặc đã hết hạn!**", ephemeral: true });
-                }
-
                 saveToken(uid, token);
-                const oldSes = activeGameSessions.get(uid);
-                if (oldSes) oldSes.stop();
+                let pinData = pinUrl ? await resolvePinterestVideo(pinUrl) : null;
 
-                let pinData = null;
-                if (pinUrl) {
-                    pinData = await resolvePinterestVideo(pinUrl);
-                }
-
-                const session = new BadgeFarmSession(uid, token, {
-                    maxGames: maxG,
-                    targetHours: maxH,
-                    streamEnabled: Boolean(pinUrl),
-                    pinUrl,
-                    pinData
-                });
+                const session = new BadgeFarmSession(uid, token, { maxGames: maxG, targetHours: maxH, streamEnabled: Boolean(pinUrl), pinUrl, pinData });
                 activeGameSessions.set(uid, session);
                 session.start();
 
-                return interaction.followUp({
-                    flags: MessageFlags.IsComponentsV2,
-                    components: buildBadgeAndStreamControlV2(uid),
-                    ephemeral: true
-                });
-            }
-
-            if (interaction.customId === 'modal:setpin') {
-                const pinUrl = interaction.fields.getTextInputValue('pin_url').trim();
-                await interaction.deferReply({ ephemeral: true });
-
-                const pinData = await resolvePinterestVideo(pinUrl);
-                const ses = activeGameSessions.get(uid);
-                if (ses && ses.isRunning) {
-                    ses.toggleStream(true, pinUrl, pinData);
-                }
-
-                return interaction.followUp({
-                    flags: MessageFlags.IsComponentsV2,
-                    components: buildBadgeAndStreamControlV2(uid),
-                    ephemeral: true
-                });
+                return interaction.reply({ flags: MessageFlags.IsComponentsV2, components: buildBadgeAndStreamControlV2(uid), ephemeral: true });
             }
         }
     } catch (err) {
-        console.error('[-] Lỗi xử lý Interaction:', err);
+        console.error('[-] Lỗi xử lý:', err);
     }
 });
 
-process.on('unhandledRejection', (err) => console.error('[UnhandledRejection]', err));
-process.on('uncaughtException', (err) => console.error('[UncaughtException]', err));
+process.on('unhandledRejection', (err) => {});
+process.on('uncaughtException', (err) => {});
 
 client.login(process.env.BOT_TOKEN);
