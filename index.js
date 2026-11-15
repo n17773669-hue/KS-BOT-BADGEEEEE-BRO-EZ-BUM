@@ -271,74 +271,118 @@ async function stopVoiceStreamer(botClient, userId) {
     return true;
 }
 
-async function startVoiceStreamer(botClient, userId, streamerToken, guildId, channelId, mediaUrl = '') {
-    if (!channelId || !streamerToken) return { ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" };
-    if (!/^\d{15,22}$/.test(channelId)) return { ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" };
-
-    await stopVoiceStreamer(botClient, userId);
-
+async function notifyUser(botClient, userId, text) {
     try {
+        const user = await botClient.users.fetch(userId);
+        await user.send(text);
+    } catch (e) {
+        console.error('[Notify] Không DM được user (có thể đang tắt DM):', e.message);
+    }
+}
+
+function withTimeout(promise, ms, label) {
+    let t;
+    const timeout = new Promise((_, reject) => {
+        t = setTimeout(() => reject(new Error(`TIMEOUT: ${label} quá ${ms / 1000}s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
+}
+
+function startVoiceStreamer(botClient, userId, streamerToken, guildId, channelId, mediaUrl = '') {
+    return new Promise(async (resolve) => {
+        if (!channelId || !streamerToken) return resolve({ ok: false, msg: "Thiếu Token hoặc Voice Channel ID!" });
+        if (!/^\d{15,22}$/.test(channelId)) return resolve({ ok: false, msg: "Voice Channel ID không hợp lệ (phải toàn số)!" });
+
+        await stopVoiceStreamer(botClient, userId);
+
         const selfClient = new SelfClient({ checkUpdate: false });
-        const sessionObj = { selfClient, ffmpeg: null, guildId, channelId, mediaUrl };
+        const sessionObj = { selfClient, ffmpeg: null, guildId: null, channelId, mediaUrl };
         activeVoiceStreamers.set(userId, sessionObj);
 
-        // QUAN TRỌNG: selfbot dùng event 'ready' (không phải 'clientReady')
-        selfClient.on('ready', async () => {
-            console.log(`[VoiceStream] Selfbot đăng nhập: ${selfClient.user.tag}`);
-            try {
-                let targetGuildId = guildId;
-                if (!targetGuildId) {
-                    const ch = await selfClient.channels.fetch(channelId).catch(() => null);
-                    if (ch && ch.guild) targetGuildId = ch.guild.id;
-                }
-                if (!targetGuildId) {
-                    console.error("[-] Không xác định được Guild ID!");
-                    return;
-                }
-                sessionObj.guildId = targetGuildId;
+        let finished = false;
+        let started = false;
 
-                // Bot chính vào voice chung
-                const botGuild = await botClient.guilds.fetch(targetGuildId).catch(() => null);
+        // Kết thúc phiên: thành công thì trả ok, thất bại thì dọn dẹp + DM báo lỗi
+        const done = async (ok, msg) => {
+            if (finished) return;
+            finished = true;
+            clearTimeout(readyTimer);
+            if (!ok) {
+                console.error('[VoiceStream] THẤT BẠI:', msg);
+                if (activeVoiceStreamers.get(userId) === sessionObj) {
+                    await stopVoiceStreamer(botClient, userId);
+                }
+                await notifyUser(botClient, userId, msg);
+            }
+            resolve({ ok, msg });
+        };
+
+        // Nếu 30s mà selfbot chưa đăng nhập xong thì báo lỗi
+        const readyTimer = setTimeout(() => {
+            if (!started) done(false, "❌ Đăng nhập tài khoản streamer quá lâu (30s). Token có thể sai hoặc acc đang bị Discord chặn tạm thời.");
+        }, 30000);
+
+        // Selfbot dùng event 'ready' (không phải 'clientReady')
+        selfClient.on('ready', async () => {
+            if (started) return; // tránh chạy 2 lần
+            started = true;
+            clearTimeout(readyTimer);
+            console.log(`[VoiceStream] Selfbot đăng nhập: ${selfClient.user.tag}`);
+
+            try {
+                // 1. Tìm phòng voice -> tự lấy Guild ID từ phòng (không tin Guild ID người dùng nhập)
+                const channel = await selfClient.channels.fetch(channelId).catch(() => null);
+                if (!channel || !channel.guild) {
+                    return done(false, `❌ Không tìm thấy Voice Channel \`${channelId}\`.\nKiểm tra lại ID, hoặc tài khoản streamer chưa tham gia server chứa phòng đó.`);
+                }
+                if (typeof channel.isVoice === 'function' && !channel.isVoice()) {
+                    return done(false, `❌ Kênh \`${channelId}\` không phải kênh Voice.`);
+                }
+
+                const targetGuildId = channel.guild.id;
+                sessionObj.guildId = targetGuildId;
+                console.log(`[+] Tìm thấy phòng: ${channel.name} (server: ${channel.guild.name})`);
+
+                // 2. Bot chính vào voice chung (nếu bot có trong server đó)
+                const botGuild = botClient.guilds.cache.get(targetGuildId);
                 if (botGuild) {
                     try {
                         botGuild.shard.send({
                             op: 4,
-                            d: {
-                                guild_id: targetGuildId,
-                                channel_id: channelId,
-                                self_mute: true,
-                                self_deaf: true
-                            }
+                            d: { guild_id: targetGuildId, channel_id: channelId, self_mute: true, self_deaf: true }
                         });
-                        console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}] thành công!`);
+                        console.log(`[BotVoice] Bot chính đã tham gia phòng [${channelId}]`);
                     } catch (err) {
                         console.error(`[BotVoice] Lỗi bot tham gia voice:`, err);
                     }
+                } else {
+                    console.log('[BotVoice] Bot chính không ở trong server này, bỏ qua.');
                 }
 
+                // 3. Selfbot vào voice (tối đa 20s)
                 const streamer = new Streamer(selfClient);
-
                 console.log("[+] Đang kết nối vào Voice Channel...");
-                await streamer.joinVoice(targetGuildId, channelId);
+                try {
+                    await withTimeout(streamer.joinVoice(targetGuildId, channelId), 20000, 'vào voice');
+                } catch (err) {
+                    console.error(err);
+                    return done(false, `❌ Không vào được phòng voice <#${channelId}> (quá 20 giây).\nCó thể acc streamer không có quyền **Kết nối** vào phòng, phòng đã đầy, hoặc phòng bị giới hạn.`);
+                }
                 console.log("[+] Đã vào phòng voice thành công!");
 
-                // Khóa cứng Mic (Mute)
+                // 4. Khóa Mic
                 await selfClient.ws.broadcast({
                     op: 4,
-                    d: {
-                        guild_id: targetGuildId,
-                        channel_id: channelId,
-                        self_mute: true,
-                        self_deaf: false
-                    }
+                    d: { guild_id: targetGuildId, channel_id: channelId, self_mute: true, self_deaf: false }
                 });
                 console.log("[+] Đã khóa cứng Mic (Mute) thành công!");
 
+                // 5. Tạo luồng stream
                 console.log("[+] Đang khởi tạo luồng stream...");
-                const udpStream = await streamer.createStream();
+                const udpStream = await withTimeout(streamer.createStream(), 20000, 'tạo luồng stream');
 
-                let resolved = mediaUrl ? await resolveMediaSource(mediaUrl) : null;
-                let ffmpegArgs = [];
+                const resolved = mediaUrl ? await resolveMediaSource(mediaUrl) : null;
+                let ffmpegArgs;
 
                 if (resolved && resolved.streamUrl) {
                     ffmpegArgs = [
@@ -373,22 +417,22 @@ async function startVoiceStreamer(botClient, userId, streamerToken, guildId, cha
                     ];
                 }
 
-                const ffmpegProc = new prism.FFmpeg({ args: ffmpegArgs });
-                sessionObj.ffmpeg = ffmpegProc;
-
+                sessionObj.ffmpeg = new prism.FFmpeg({ args: ffmpegArgs });
                 console.log(`[VoiceStream] Stream đang chạy ngầm ổn định!`);
+
+                done(true, `Đã vào phòng **${channel.name}**`);
             } catch (err) {
                 console.error(`[VoiceStream] Lỗi luồng stream:`, err);
+                done(false, `❌ Lỗi khi stream: ${err.message}`);
             }
         });
 
-        await selfClient.login(streamerToken);
-        return { ok: true };
-    } catch (err) {
-        console.error('[VoiceStream] Lỗi đăng nhập selfbot:', err);
-        activeVoiceStreamers.delete(userId);
-        return { ok: false, msg: err.message };
-    }
+        // Token sai -> login ném lỗi
+        selfClient.login(streamerToken).catch((err) => {
+            console.error('[VoiceStream] Lỗi đăng nhập selfbot:', err);
+            done(false, `❌ Token không hợp lệ hoặc không đăng nhập được.\nChi tiết: ${err.message}`);
+        });
+    });
 }
 
 // ==============================================================================
@@ -572,14 +616,6 @@ client.on('interactionCreate', async (interaction) => {
                             .setValue(savedV.mediaUrl || '')
                             .setStyle(TextInputStyle.Short)
                             .setRequired(false)
-                    ),
-                    new ActionRowBuilder().addComponents(
-                        new TextInputBuilder()
-                            .setCustomId('guild_id')
-                            .setLabel('Guild ID (Tự nhận diện - Không bắt buộc)')
-                            .setValue(currentGuildId)
-                            .setStyle(TextInputStyle.Short)
-                            .setRequired(false)
                     )
                 );
                 return interaction.showModal(modal);
@@ -633,7 +669,7 @@ client.on('interactionCreate', async (interaction) => {
                 const token = interaction.fields.getTextInputValue('streamer_token').trim();
                 const channelId = interaction.fields.getTextInputValue('channel_id').trim();
                 const mediaUrl = interaction.fields.getTextInputValue('media_url').trim();
-                const guildId = interaction.fields.getTextInputValue('guild_id').trim() || interaction.guildId || '';
+                const guildId = ''; // Guild ID tự lấy từ phòng voice
 
                 saveToken(uid, token);
                 db.set('voice_streams', uid, { streamerToken: token, guildId, channelId, mediaUrl });
