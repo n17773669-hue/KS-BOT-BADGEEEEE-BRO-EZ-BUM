@@ -150,46 +150,66 @@ class DiscordCloudDB {
         } catch (e) {}
     }
 
+    // Thay thế đoạn phương thức init trong class DiscordCloudDB bằng đoạn code này để hiện thông báo lỗi chi tiết nếu thiếu quyền:
+
     async init(client) {
         for (const table of Object.keys(DB_CHANNELS_SPEC)) {
             this.store[table] = this._readLocal(table);
         }
 
-        const guild = await client.guilds.fetch(DB_GUILD_ID).catch(() => null);
-        if (!guild) {
-            console.error(`[-] Không tìm thấy Server lưu trữ ID: ${DB_GUILD_ID}. Bot sẽ tạm dùng cache cục bộ.`);
+        const guild = await client.guilds.fetch(DB_GUILD_ID).catch((err) => {
+            console.error(`[-] Không thể truy cập Server lưu trữ ID: ${DB_GUILD_ID}. Lỗi:`, err.message);
+            return null;
+        });
+        if (!guild) return;
+
+        console.log(`[CloudDB] Đã kết nối Server lưu trữ: ${guild.name} (${guild.id})`);
+        
+        let allChannels;
+        try {
+            allChannels = await guild.channels.fetch();
+        } catch (err) {
+            console.error(`[-] Bot không có quyền đọc danh sách kênh trên server DB! Hãy cấp quyền Administrator cho bot tại server DB.`);
             return;
         }
 
-        console.log(`[CloudDB] Đã kết nối Server lưu trữ: ${guild.name} (${guild.id})`);
-        const allChannels = await guild.channels.fetch();
-
         let category = allChannels.find(c => c.type === ChannelType.GuildCategory && c.name === 'BOT-CLOUD-DB');
         if (!category) {
-            category = await guild.channels.create({
-                name: 'BOT-CLOUD-DB',
-                type: ChannelType.GuildCategory,
-                permissionOverwrites: [
-                    { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                    { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] }
-                ]
-            });
-            console.log(`[CloudDB] Đã tạo danh mục bảo mật: BOT-CLOUD-DB`);
+            try {
+                category = await guild.channels.create({
+                    name: 'BOT-CLOUD-DB',
+                    type: ChannelType.GuildCategory,
+                    permissionOverwrites: [
+                        { id: guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+                        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] }
+                    ]
+                });
+                console.log(`[CloudDB] Đã tạo thành công danh mục bảo mật: BOT-CLOUD-DB`);
+            } catch (err) {
+                console.error(`[-] Lỗi khi tạo danh mục BOT-CLOUD-DB (Kiểm tra lại quyền Quản lý Kênh của bot):`, err.message);
+                return;
+            }
         }
 
         for (const [table, chName] of Object.entries(DB_CHANNELS_SPEC)) {
             let channel = allChannels.find(c => c.type === ChannelType.GuildText && c.name === chName);
             if (!channel) {
-                channel = await guild.channels.create({
-                    name: chName,
-                    type: ChannelType.GuildText,
-                    parent: category.id,
-                    topic: `Hệ thống lưu trữ tự động bảng [${table}] - Không xóa thủ công!`
-                });
-                console.log(`[CloudDB] Đã khởi tạo kênh lưu trữ: #${chName}`);
+                try {
+                    channel = await guild.channels.create({
+                        name: chName,
+                        type: ChannelType.GuildText,
+                        parent: category.id,
+                        topic: `Hệ thống lưu trữ tự động bảng [${table}] - Không xóa thủ công!`
+                    });
+                    console.log(`[CloudDB] Đã khởi tạo thành công kênh lưu trữ: #${chName}`);
+                } catch (e) {
+                    console.error(`[-] Không thể tạo kênh #${chName}:`, e.message);
+                }
             }
-            this.channels[table] = channel;
-            await this._loadFromChannel(table, channel);
+            if (channel) {
+                this.channels[table] = channel;
+                await this._loadFromChannel(table, channel);
+            }
         }
     }
 
